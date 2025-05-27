@@ -41,6 +41,7 @@ class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
+    finetune_cameras: list
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
@@ -106,6 +107,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
                 print("\n", key, "not found in depths_params")
 
         image_path = os.path.join(images_folder, extr.name)
+        if not os.path.exists(image_path):
+            image_path = os.path.join(images_folder.replace("images", "images_ft"), os.path.basename(extr.name))
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
@@ -144,8 +147,8 @@ def storePly(path, xyz, rgb):
 
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(path, "aligned_sparse/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, "aligned_sparse/0", "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
@@ -154,7 +157,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
+    depth_params_file = os.path.join(path, "aligned_sparse/0", "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -197,14 +200,45 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
-    test_cam_infos = [c for c in cam_infos if c.is_test]
+    # train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    # test_cam_infos = [c for c in cam_infos if c.is_test]
+    
+    train_cam_infos = []
+    finetune_cam_infos = []
+    test_cam_infos = []
+    
+    for c in cam_infos:
+        if train_test_exp or not c.is_test:
+            if "images_ft" in c.image_path:
+                finetune_cam_infos.append(c)
+            else:
+                train_cam_infos.append(c)
+        if c.is_test:
+            test_cam_infos.append(c)
+    # if train_list is not None:
+    #     train_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in train_list]
+    #     test_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in test_list]
+    #     print(f"train_cam_infos {len(train_cam_infos)}, test_cam_infos {len(test_cam_infos)}")
+    # elif eval:
+    #     train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+    #     test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    # else:
+    #     train_cam_infos = []
+    #     finetune_cam_infos = []
+    #     for c in cam_infos:
+    #         if "images_ft" in c.image_path:
+    #             finetune_cam_infos.append(c)
+    #         else:
+    #             train_cam_infos.append(c)
+    #     test_cam_infos = []
+        
+    
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(path, "aligned_sparse/0/points3D.ply")
+    bin_path = os.path.join(path, "aligned_sparse/0/points3D.bin")
+    txt_path = os.path.join(path, "aligned_sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
@@ -220,6 +254,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
+                           finetune_cameras=finetune_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
                            is_nerf_synthetic=False)

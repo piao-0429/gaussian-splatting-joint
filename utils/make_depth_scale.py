@@ -71,7 +71,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
 
-    cam_intrinsics, images_metas, points3d = read_model(os.path.join(args.base_dir, "sparse", "0"), ext=f".{args.model_type}")
+    cam_intrinsics, images_metas, points3d = read_model(os.path.join(args.base_dir, "aligned_sparse", "0"), ext=f".{args.model_type}")
 
     pts_indices = np.array([points3d[key].id for key in points3d])
     pts_xyzs = np.array([points3d[key].xyz for key in points3d])
@@ -88,7 +88,32 @@ if __name__ == '__main__':
         for depth_param in depth_param_list if depth_param != None
     }
 
-    with open(f"{args.base_dir}/sparse/0/depth_params.json", "w") as f:
-        json.dump(depth_params, f, indent=2)
+    file_path = f"{args.base_dir}/aligned_sparse/0/depth_params.json"
+
+    # 确保目录存在
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    if not os.path.exists(file_path) or os.stat(file_path).st_size == 0:
+        # 文件不存在或为空，直接写入
+        with open(file_path, "w") as f:
+            json.dump(depth_params, f, indent=2)
+    else:
+        with open(file_path, "r+") as f:
+            try:
+                existing_data = json.load(f)
+                if isinstance(existing_data, dict):
+                    # 合并字典（更新已有键或添加新键）
+                    existing_data.update(depth_params)
+                    # 回到文件开头并清空文件
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(existing_data, f, indent=2)
+                else:
+                    raise ValueError("Existing JSON is not a dictionary.")
+            except json.JSONDecodeError:
+                # 如果文件内容不是合法的 JSON，则覆盖
+                f.seek(0)
+                f.truncate()
+                json.dump(depth_params, f, indent=2)
 
     print(0)

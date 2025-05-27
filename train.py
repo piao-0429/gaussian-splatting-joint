@@ -39,6 +39,44 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+    
+def merge_gaussians(gaussians):
+    """
+    Merge the gaussians from the two models
+    
+    Args:
+        gaussians (list): List of several GaussianModel objects to be merged.
+        
+    Returns:
+        GaussianModel: A new GaussianModel object containing the merged data.
+    """
+    # merged_gaussians = GaussianModel(sh_degree)
+    merged_xyz = []
+    merged_features_dc = []
+    merged_features_rest = []
+    merged_scaling = []
+    merged_rotation = []
+    merged_opacity = []
+
+    for g in gaussians:
+        merged_xyz.append(g._xyz)
+        merged_features_dc.append(g._features_dc)
+        merged_features_rest.append(g._features_rest)
+        merged_scaling.append(g._scaling)
+        merged_rotation.append(g._rotation)
+        merged_opacity.append(g._opacity)
+
+    merged_gaussians = GaussianModel(gaussians[0].max_sh_degree)
+    merged_gaussians._xyz = torch.cat(merged_xyz, dim=0)
+    merged_gaussians._features_dc = torch.cat(merged_features_dc, dim=0)
+    merged_gaussians._features_rest = torch.cat(merged_features_rest, dim=0)
+    merged_gaussians._scaling = torch.cat(merged_scaling, dim=0)
+    merged_gaussians._rotation = torch.cat(merged_rotation, dim=0)
+    merged_gaussians._opacity = torch.cat(merged_opacity, dim=0)
+    assert gaussians[0].active_sh_degree == gaussians[1].active_sh_degree
+    merged_gaussians.active_sh_degree = gaussians[0].active_sh_degree
+
+    return merged_gaussians
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -48,8 +86,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    obj_gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    scene = Scene(dataset, gaussians, obj_gaussians)
     gaussians.training_setup(opt)
+    obj_gaussians.finetuning_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -64,7 +104,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
+    ft_viewpoint_stack = scene.getFinetuneCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
+    ft_viewpoint_indices = list(range(len(ft_viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
@@ -90,17 +132,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
+        # # Every 1000 its we increase the levels of SH up to a maximum degree
+        # if iteration % 1000 == 0:
+        #     gaussians.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
+        if not ft_viewpoint_stack:
+            ft_viewpoint_stack = scene.getFinetuneCameras().copy()
+            ft_viewpoint_indices = list(range(len(ft_viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
+        ft_rand_idx = randint(0, len(ft_viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
+        ft_viewpoint_cam = ft_viewpoint_stack.pop(ft_rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
+        ft_vind = ft_viewpoint_indices.pop(ft_rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -114,14 +162,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
+            
+        ft_render_pkg = render(ft_viewpoint_cam, merge_gaussians([gaussians, obj_gaussians]), pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        ft_image = ft_render_pkg["render"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        ft_gt_image = ft_viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image) + l1_loss(ft_image, ft_gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
-            ssim_value = ssim(image, gt_image)
+            ssim_value = ssim(image, gt_image) + ssim(ft_image, ft_gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -138,6 +190,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+        
+        ft_Ll1depth_pure = 0.0
+        if depth_l1_weight(iteration) > 0 and ft_viewpoint_cam.depth_reliable:
+            ft_invDepth = ft_render_pkg["depth"]
+            ft_mono_invdepth = ft_viewpoint_cam.invdepthmap.cuda()
+            ft_depth_mask = ft_viewpoint_cam.depth_mask.cuda()
+
+            ft_Ll1depth_pure += torch.abs((ft_invDepth  - ft_mono_invdepth) * ft_depth_mask).mean()
+            ft_Ll1depth = depth_l1_weight(iteration) * ft_Ll1depth_pure 
+            loss += ft_Ll1depth
+            Ll1depth += ft_Ll1depth.item()
 
         loss.backward()
 
@@ -184,6 +247,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                    obj_gaussians.optimizer.step()
+                    obj_gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

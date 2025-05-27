@@ -70,7 +70,11 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_syntheti
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
+        try:
+            camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
+        except Exception as e:
+            # print(f"Error loading camera {id}: {e}")
+            continue
 
     return camera_list
 

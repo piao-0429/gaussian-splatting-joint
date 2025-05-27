@@ -21,14 +21,17 @@ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 class Scene:
 
     gaussians : GaussianModel
+    obj_gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, obj_gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.obj_gaussians = obj_gaussians
+        self.obj_ply_path = args.obj_ply_path
 
         if load_iteration:
             if load_iteration == -1:
@@ -39,6 +42,7 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.finetune_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
@@ -57,6 +61,8 @@ class Scene:
                 camlist.extend(scene_info.test_cameras)
             if scene_info.train_cameras:
                 camlist.extend(scene_info.train_cameras)
+            if scene_info.finetune_cameras:
+                camlist.extend(scene_info.finetune_cameras)
             for id, cam in enumerate(camlist):
                 json_cams.append(camera_to_JSON(id, cam))
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
@@ -65,6 +71,8 @@ class Scene:
         if shuffle:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+            if scene_info.finetune_cameras:
+                random.shuffle(scene_info.finetune_cameras)
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
@@ -73,18 +81,24 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+            if scene_info.finetune_cameras:
+                print("Loading Finetune Cameras")
+                self.finetune_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.finetune_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
+            self.obj_gaussians.load_obj_ply(self.obj_ply_path)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+            self.obj_gaussians.load_obj_ply(self.obj_ply_path)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.obj_gaussians.save_ply(os.path.join(point_cloud_path, "obj.ply"))
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping
@@ -98,3 +112,9 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getFinetuneCameras(self, scale=1.0):
+        if self.finetune_cameras:
+            return self.finetune_cameras[scale]
+        else:
+            return []
