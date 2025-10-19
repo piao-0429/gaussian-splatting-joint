@@ -176,7 +176,12 @@ class GaussianModel:
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
         
     def finetuning_setup(self, training_args):
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        
         l = [
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * max(self.spatial_lr_scale, 1.0) / 10.0, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr / 10.0, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 200.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr / 10.0, "name": "opacity"},
@@ -406,8 +411,8 @@ class GaussianModel:
             for idx, attr_name in enumerate(rot_names):
                 rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-            # Keep previous behavior for object PLYs saved by this project
-            self._xyz = torch.tensor(xyz, dtype=torch.float, device="cuda")
+            # Keep previous behavior for object PLYs saved by this project, but ensure learnable Parameter for xyz
+            self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
             self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
             self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
             self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -599,5 +604,13 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # 防御：当切片未保留梯度或该步无梯度时跳过
+        if viewspace_point_tensor.grad is None:
+            return
+        # 设备对齐，避免 cpu/cuda 掩码不一致
+        if self.xyz_gradient_accum.device != update_filter.device:
+            update_filter = update_filter.to(self.xyz_gradient_accum.device)
+        self.xyz_gradient_accum[update_filter] += torch.norm(
+            viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
+        )
         self.denom[update_filter] += 1

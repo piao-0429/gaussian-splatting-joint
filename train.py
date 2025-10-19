@@ -159,21 +159,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        # Object-only variables
+        # ----- 已删除（后加）：obj-only 渲染调用，改为使用合并渲染的切片作为 obj 的 densify 统计来源，节省重复渲染 -----
+        # obj_render_pkg = render(ft_viewpoint_cam, obj_gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        # obj_viewspace_point_tensor = obj_render_pkg["viewspace_points"]
+        # obj_visibility_filter = obj_render_pkg["visibility_filter"]
+        # obj_radii = obj_render_pkg["radii"]
+
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
             
+        # Object + Scene = Combined variables
         ft_render_pkg = render(ft_viewpoint_cam, merge_gaussians([gaussians, obj_gaussians]), pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         ft_image = ft_render_pkg["render"]
+
+        # ----- 后加：为 obj densify 预留切片，并对切片 retain_grad，确保反传后 grad 可用 -----
+        n_scene = gaussians.get_xyz.shape[0]
+        n_obj   = obj_gaussians.get_xyz.shape[0]
+        merged_viewspace = ft_render_pkg["viewspace_points"]
+        merged_vis       = ft_render_pkg["visibility_filter"]
+        merged_radii     = ft_render_pkg["radii"]
+
+        obj_viewspace_from_merged = merged_viewspace[n_scene:n_scene + n_obj]
+        obj_vis_from_merged       = merged_vis[n_scene:n_scene + n_obj]
+        obj_radii_from_merged     = merged_radii[n_scene:n_scene + n_obj]
+
+        # VERY IMPORTANT: retain grad for obj_viewspace_from_merged
+        obj_viewspace_from_merged.retain_grad()
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         ft_gt_image = ft_viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image) + l1_loss(ft_image, ft_gt_image)
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim1 = fused_ssim(image.unsqueeze(0),    gt_image.unsqueeze(0))
+            ssim2 = fused_ssim(ft_image.unsqueeze(0), ft_gt_image.unsqueeze(0))
         else:
-            ssim_value = ssim(image, gt_image) + ssim(ft_image, ft_gt_image)
+            ssim1 = ssim(image, gt_image)
+            ssim2 = ssim(ft_image, ft_gt_image)
+        ssim_value = 0.5 * (ssim1 + ssim2)
+        ssim_value = torch.clamp(ssim_value, 0.0, 1.0)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -226,15 +252,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
+                # Scene: 继续使用 scene-only 渲染统计（viewspace_point_tensor, visibility_filter, radii）
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                # Obj: ----- 后加：复用上文预留的 obj 切片（已 retain_grad），避免重新切片导致 grad 丢失 -----
+                if obj_viewspace_from_merged.grad is not None:
+                    obj_gaussians.max_radii2D[obj_vis_from_merged] = torch.max(
+                        obj_gaussians.max_radii2D[obj_vis_from_merged],
+                        obj_radii_from_merged[obj_vis_from_merged]
+                    )
+                    obj_gaussians.add_densification_stats(
+                        obj_viewspace_from_merged, obj_vis_from_merged
+                    )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    obj_gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, obj_radii_from_merged)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                    obj_gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
