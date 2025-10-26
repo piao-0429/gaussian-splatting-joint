@@ -11,6 +11,7 @@
 
 import torch
 import math
+import numpy as np
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
@@ -126,3 +127,66 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         }
     
     return out
+
+
+def render_debug_mask(viewpoint_camera, pc: GaussianModel, object_mask: torch.Tensor):
+    """Visualize Gaussian projections relative to a binary object mask."""
+
+    height = int(viewpoint_camera.image_height)
+    width = int(viewpoint_camera.image_width)
+
+    canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+
+    if object_mask is None or pc.get_xyz.numel() == 0:
+        return canvas
+
+    device = pc.get_xyz.device
+    homo_positions = torch.cat(
+        [pc.get_xyz, torch.ones((pc.get_xyz.shape[0], 1), device=device, dtype=pc.get_xyz.dtype)],
+        dim=1,
+    )
+
+    clip_coords = torch.matmul(homo_positions, viewpoint_camera.full_proj_transform)
+    clip_w = clip_coords[:, 3]
+    positive_w = clip_w > 0
+    if positive_w.sum() == 0:
+        return canvas
+
+    clip_coords = clip_coords[positive_w]
+    ndc = clip_coords[:, :3] / clip_coords[:, 3:4]
+
+    inside_frustum = (
+        (ndc[:, 0] >= -1.0)
+        & (ndc[:, 0] <= 1.0)
+        & (ndc[:, 1] >= -1.0)
+        & (ndc[:, 1] <= 1.0)
+    )
+    if inside_frustum.sum() == 0:
+        return canvas
+
+    ndc = ndc[inside_frustum]
+
+    screen_x = ((ndc[:, 0] * 0.5 + 0.5) * (width - 1)).round().long()
+    screen_y = ((ndc[:, 1] * 0.5 + 0.5) * (height - 1)).round().long()
+
+    screen_x = torch.clamp(screen_x, 0, width - 1)
+    screen_y = torch.clamp(screen_y, 0, height - 1)
+
+    mask_cpu = object_mask.squeeze(0).detach().cpu()
+    mask_values = mask_cpu[screen_y.cpu(), screen_x.cpu()] > 0.5
+
+    coords = torch.stack([screen_y, screen_x], dim=1).cpu().numpy()
+    mask_values = mask_values.numpy()
+
+    blue = np.array([0, 0, 255], dtype=np.uint8)
+    red = np.array([255, 0, 0], dtype=np.uint8)
+
+    for (y, x), is_inside in zip(coords, mask_values):
+        color = blue if is_inside else red
+        y0 = max(y - 1, 0)
+        y1 = min(y + 2, height)
+        x0 = max(x - 1, 0)
+        x1 = min(x + 2, width)
+        canvas[y0:y1, x0:x1] = color
+
+    return canvas

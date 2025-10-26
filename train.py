@@ -10,16 +10,20 @@
 #
 
 import os
+import math
 import torch
+import torch.nn.functional as F
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, render_debug_mask, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from PIL import Image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -40,6 +44,123 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
     
+_GAUSSIAN_KERNEL_CACHE = {}
+
+
+def _get_gaussian_kernel(sigma: float, device: torch.device):
+    sigma_eff = max(float(sigma), 1e-6)
+    key = (sigma_eff, str(device))
+    if key in _GAUSSIAN_KERNEL_CACHE:
+        return _GAUSSIAN_KERNEL_CACHE[key]
+
+    radius = max(1, int(math.ceil(3.0 * sigma_eff)))
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+    kernel1d = torch.exp(-0.5 * (coords / sigma_eff) ** 2)
+    kernel1d /= kernel1d.sum()
+    kernel2d = torch.matmul(kernel1d.unsqueeze(1), kernel1d.unsqueeze(0))
+    kernel = kernel2d.unsqueeze(0).unsqueeze(0)
+    _GAUSSIAN_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def prune_gaussians_with_object_masks(gaussians, cameras, min_visible_views=1, mask_threshold=0.5, mask_blur_sigma=0.0):
+    """Prune Gaussians that fall outside per-view object masks."""
+
+    if gaussians.get_xyz.numel() == 0:
+        return 0
+
+    mask_cameras = [cam for cam in cameras if getattr(cam, "object_mask", None) is not None]
+    if len(mask_cameras) == 0:
+        return 0
+
+    device = gaussians.get_xyz.device
+    positions = gaussians.get_xyz.detach()
+    homo_positions = torch.cat(
+        [positions, torch.ones((positions.shape[0], 1), device=device, dtype=positions.dtype)],
+        dim=1,
+    )
+
+    seen_counts = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+    inside_counts = torch.zeros_like(seen_counts)
+
+    for camera in mask_cameras:
+        mask_tensor = camera.object_mask
+        if mask_tensor is None:
+            continue
+
+        mask_tensor = mask_tensor.squeeze(0)
+        if mask_tensor.device != device:
+            mask_tensor = mask_tensor.to(device=device)
+        mask_tensor = mask_tensor.to(dtype=torch.float32)
+
+        if mask_blur_sigma > 0:
+            kernel = _get_gaussian_kernel(mask_blur_sigma, mask_tensor.device)
+            pad = kernel.shape[-1] // 2
+            mask_tensor = F.conv2d(
+                mask_tensor.unsqueeze(0).unsqueeze(0),
+                kernel,
+                padding=pad,
+            ).squeeze(0).squeeze(0)
+            mask_tensor = mask_tensor.clamp(0.0, 1.0)
+
+        full_proj = camera.full_proj_transform
+        if full_proj.device != device:
+            full_proj = full_proj.to(device)
+
+        clip_coords = torch.matmul(homo_positions, full_proj)
+        clip_w = clip_coords[:, 3]
+        positive_w = clip_w > 0
+        if positive_w.sum() == 0:
+            continue
+
+        clip_coords = clip_coords[positive_w]
+        indices = torch.nonzero(positive_w, as_tuple=False).squeeze(1)
+
+        ndc = clip_coords[:, :3] / clip_coords[:, 3:4]
+        inside_frustum = (
+            (ndc[:, 0] >= -1.0)
+            & (ndc[:, 0] <= 1.0)
+            & (ndc[:, 1] >= -1.0)
+            & (ndc[:, 1] <= 1.0)
+        )
+
+        if inside_frustum.sum() == 0:
+            continue
+
+        ndc = ndc[inside_frustum]
+        indices = indices[inside_frustum]
+
+        width = int(camera.image_width)
+        height = int(camera.image_height)
+
+        screen_x = ((ndc[:, 0] * 0.5 + 0.5) * (width - 1)).round().long()
+        screen_y = ((ndc[:, 1] * 0.5 + 0.5) * (height - 1)).round().long()
+
+        screen_x = torch.clamp(screen_x, 0, width - 1)
+        screen_y = torch.clamp(screen_y, 0, height - 1)
+
+        mask_values = mask_tensor[screen_y, screen_x] > mask_threshold
+
+        seen_counts[indices] += 1
+        inside_counts[indices] += mask_values.to(torch.int32)
+
+    background_counts = (seen_counts - inside_counts).clamp_min(0)
+    threshold = max(min_visible_views, 1)
+    prune_mask = background_counts >= threshold
+
+    if min_visible_views > 0:
+        prune_mask = prune_mask | (seen_counts < min_visible_views)
+
+    removed = int(prune_mask.sum().item())
+    if removed > 0:
+        if not hasattr(gaussians, "tmp_radii") or gaussians.tmp_radii is None or gaussians.tmp_radii.shape[0] != positions.shape[0]:
+            gaussians.tmp_radii = positions.new_zeros((positions.shape[0],))
+        gaussians.prune_points(prune_mask)
+        gaussians.tmp_radii = None
+
+    return removed
+
+
 def merge_gaussians(gaussians):
     """
     Merge the gaussians from the two models
@@ -90,6 +211,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians, obj_gaussians)
     gaussians.training_setup(opt)
     obj_gaussians.finetuning_setup(opt)
+
+    ft_debug_mask_dir = None
+    try:
+        finetune_cameras_all = scene.getFinetuneCameras()
+        if finetune_cameras_all:
+            if any(getattr(cam, "object_mask", None) is not None for cam in finetune_cameras_all):
+                ft_debug_mask_dir = os.path.join(dataset.model_path, "ft_debug_mask")
+                os.makedirs(ft_debug_mask_dir, exist_ok=True)
+    except Exception:
+        pass
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -174,31 +305,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ft_render_pkg = render(ft_viewpoint_cam, merge_gaussians([gaussians, obj_gaussians]), pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         ft_image = ft_render_pkg["render"]
 
-        # ----- 后加：为 obj densify 预留切片，并对切片 retain_grad，确保反传后 grad 可用 -----
-        n_scene = gaussians.get_xyz.shape[0]
-        n_obj   = obj_gaussians.get_xyz.shape[0]
-        merged_viewspace = ft_render_pkg["viewspace_points"]
-        merged_vis       = ft_render_pkg["visibility_filter"]
-        merged_radii     = ft_render_pkg["radii"]
+        obj_render_pkg = render(ft_viewpoint_cam, obj_gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        obj_image = obj_render_pkg["render"]
 
-        obj_viewspace_from_merged = merged_viewspace[n_scene:n_scene + n_obj]
-        obj_vis_from_merged       = merged_vis[n_scene:n_scene + n_obj]
-        obj_radii_from_merged     = merged_radii[n_scene:n_scene + n_obj]
+        if ft_viewpoint_cam.alpha_mask is not None:
+            alpha_mask_ft = ft_viewpoint_cam.alpha_mask
+            ft_image *= alpha_mask_ft
+            obj_image *= alpha_mask_ft
 
-        # VERY IMPORTANT: retain grad for obj_viewspace_from_merged
-        obj_viewspace_from_merged.retain_grad()
+        ft_gt_image = ft_viewpoint_cam.original_image.cuda()
+        obj_gt_image = ft_gt_image.clone()
+
+        ft_object_mask = getattr(ft_viewpoint_cam, "object_mask", None)
+        if ft_object_mask is not None:
+            ft_mask_tensor = ft_object_mask.to(ft_image.device)
+            ft_image = ft_image * ft_mask_tensor
+            obj_image = obj_image * ft_mask_tensor
+            ft_gt_image = ft_gt_image * ft_mask_tensor
+            obj_gt_image = obj_gt_image * ft_mask_tensor
+
+            if ft_debug_mask_dir and iteration % 500 == 0:
+                debug_image = render_debug_mask(ft_viewpoint_cam, obj_gaussians, ft_object_mask)
+
+                ft_gt_image_np = (
+                    ft_viewpoint_cam.original_image
+                    .detach()
+                    .clamp(0.0, 1.0)
+                    .cpu()
+                    .permute(1, 2, 0)
+                    .numpy()
+                )
+                ft_gt_image_np = (ft_gt_image_np * 255.0).astype(np.uint8)
+
+                mask_np = ft_object_mask.detach().cpu().squeeze(0).numpy()
+                mask_rgb = (np.stack([mask_np, mask_np, mask_np], axis=2) * 255.0).astype(np.uint8)
+
+                composite = np.concatenate([ft_gt_image_np, mask_rgb, debug_image], axis=1)
+                debug_path = os.path.join(ft_debug_mask_dir, f"iter_{iteration:06d}_{ft_viewpoint_cam.image_name}.png")
+                Image.fromarray(composite).save(debug_path)
+
+        obj_viewspace_point_tensor = obj_render_pkg["viewspace_points"]
+        obj_visibility_filter = obj_render_pkg["visibility_filter"]
+        obj_radii = obj_render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        ft_gt_image = ft_viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image) + l1_loss(ft_image, ft_gt_image)
+
+        Ll1 = l1_loss(image, gt_image) + l1_loss(ft_image, ft_gt_image) + l1_loss(obj_image, obj_gt_image)
         if FUSED_SSIM_AVAILABLE:
-            ssim1 = fused_ssim(image.unsqueeze(0),    gt_image.unsqueeze(0))
-            ssim2 = fused_ssim(ft_image.unsqueeze(0), ft_gt_image.unsqueeze(0))
+            ssim_scene = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_ft = fused_ssim(ft_image.unsqueeze(0), ft_gt_image.unsqueeze(0))
+            ssim_obj = fused_ssim(obj_image.unsqueeze(0), obj_gt_image.unsqueeze(0))
         else:
-            ssim1 = ssim(image, gt_image)
-            ssim2 = ssim(ft_image, ft_gt_image)
-        ssim_value = 0.5 * (ssim1 + ssim2)
+            ssim_scene = ssim(image, gt_image)
+            ssim_ft = ssim(ft_image, ft_gt_image)
+            ssim_obj = ssim(obj_image, obj_gt_image)
+
+        ssim_value = torch.stack([ssim_scene, ssim_ft, ssim_obj]).mean()
         ssim_value = torch.clamp(ssim_value, 0.0, 1.0)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
@@ -210,21 +373,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
-        
+
         ft_Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and ft_viewpoint_cam.depth_reliable:
             ft_invDepth = ft_render_pkg["depth"]
             ft_mono_invdepth = ft_viewpoint_cam.invdepthmap.cuda()
             ft_depth_mask = ft_viewpoint_cam.depth_mask.cuda()
+            if ft_object_mask is not None:
+                ft_depth_mask = ft_depth_mask * ft_object_mask
 
-            ft_Ll1depth_pure += torch.abs((ft_invDepth  - ft_mono_invdepth) * ft_depth_mask).mean()
-            ft_Ll1depth = depth_l1_weight(iteration) * ft_Ll1depth_pure 
+            ft_Ll1depth_pure += torch.abs((ft_invDepth - ft_mono_invdepth) * ft_depth_mask).mean()
+            ft_Ll1depth = depth_l1_weight(iteration) * ft_Ll1depth_pure
             loss += ft_Ll1depth
             Ll1depth += ft_Ll1depth.item()
 
@@ -233,6 +398,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
+            pruned_this_iter = False
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -246,30 +412,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
+                pruned = 0
+                ft_cams_current = scene.getFinetuneCameras()
+                if opt.mask_prune_on_save and ft_cams_current:
+                    pruned = prune_gaussians_with_object_masks(
+                        obj_gaussians,
+                        ft_cams_current,
+                        min_visible_views=opt.mask_prune_min_views,
+                        mask_threshold=opt.mask_prune_threshold,
+                        mask_blur_sigma=opt.mask_prune_blur_sigma,
+                    )
+                    if pruned > 0:
+                        pruned_this_iter = True
+                        print("\n[ITER {}] Mask pruning removed {} object Gaussians".format(iteration, pruned))
+
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if (not pruned_this_iter) and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 # Scene: 继续使用 scene-only 渲染统计（viewspace_point_tensor, visibility_filter, radii）
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                # Obj: ----- 后加：复用上文预留的 obj 切片（已 retain_grad），避免重新切片导致 grad 丢失 -----
-                if obj_viewspace_from_merged.grad is not None:
-                    obj_gaussians.max_radii2D[obj_vis_from_merged] = torch.max(
-                        obj_gaussians.max_radii2D[obj_vis_from_merged],
-                        obj_radii_from_merged[obj_vis_from_merged]
+                # Obj: 使用独立渲染结果进行 densify 统计
+                if obj_viewspace_point_tensor.grad is not None:
+                    obj_gaussians.max_radii2D[obj_visibility_filter] = torch.max(
+                        obj_gaussians.max_radii2D[obj_visibility_filter],
+                        obj_radii[obj_visibility_filter]
                     )
                     obj_gaussians.add_densification_stats(
-                        obj_viewspace_from_merged, obj_vis_from_merged
+                        obj_viewspace_point_tensor, obj_visibility_filter
                     )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    obj_gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, obj_radii_from_merged)
+                    obj_gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, obj_radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
