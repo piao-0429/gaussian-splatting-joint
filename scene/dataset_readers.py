@@ -128,14 +128,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_path = os.path.join(images_folder, extr.name)
         if not os.path.exists(image_path):
             image_path = os.path.join(images_folder.replace("images", "images_ft"), os.path.basename(extr.name))
-        if not os.path.exists(image_path):
-            image_path = os.path.join(images_folder.replace("images", "images_ft_obj"), os.path.basename(extr.name))
+        # if not os.path.exists(image_path):
+        #     image_path = os.path.join(images_folder.replace("images", "images_ft_obj"), os.path.basename(extr.name))
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
         stem_name = extr.name[:-n_remove]
 
         mask_path = ""
-        is_finetune = "images_ft" in image_path or "images_ft_obj" in image_path
+        # is_finetune = "images_ft" in image_path or "images_ft_obj" in image_path
+        is_finetune = "images_ft" in image_path
         if is_finetune:
             mask_path = find_mask(ft_masks_folder, extr.name, stem_name)
 

@@ -175,11 +175,15 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
         
-    def finetuning_setup(self, training_args):
+    def obj_training_setup(self, training_args):
+        """
+        Object-only training setup: use the original finetuning LRs (pre-transition),
+        no exposure optimizer, safe for object branch.
+        """
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -187,6 +191,25 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+        ]
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+    def finetuning_setup(self, training_args):
+        """
+        Post object-only phase finetuning: use smaller LRs for better stability.
+        Keep all parameter groups; XYZ LR remains as in object training unless otherwise specified.
+        """
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        
+        l = [
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale / 10.0, "name": "xyz"},
+            {'params': [self._features_dc], 'lr': training_args.feature_lr / 10.0, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / 200.0, "name": "f_rest"},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr / 10.0, "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr / 10.0, "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr / 10.0, "name": "rotation"}
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
