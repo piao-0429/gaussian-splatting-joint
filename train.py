@@ -391,42 +391,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Depth regularization: three branches to mirror RGB losses
+        # Depth regularization (clean, unified style)
         Ll1depth = 0.0
 
-        # 1) Scene depth loss (train camera)
+        # 1) Scene depth (full-frame supervision; compare predicted invdepth to full GT)
         if depth_l1_weight(iteration) > 0 and getattr(viewpoint_cam, "depth_reliable", False):
-            invDepth_scene = render_pkg.get("depth", None)
-            if invDepth_scene is not None and getattr(viewpoint_cam, "invdepthmap", None) is not None:
-                mono_invdepth_scene = viewpoint_cam.invdepthmap.cuda()
-                depth_mask_scene = viewpoint_cam.depth_mask.cuda()
-                scene_Ll1depth_pure = torch.abs((invDepth_scene - mono_invdepth_scene) * depth_mask_scene).mean()
-                scene_Ll1depth = depth_l1_weight(iteration) * scene_Ll1depth_pure
-                loss += scene_Ll1depth
-                Ll1depth += scene_Ll1depth.item()
+            invDepth = render_pkg.get("depth", None)
+            if invDepth is not None and getattr(viewpoint_cam, "invdepthmap", None) is not None:
+                mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+                Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
+                Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
+                loss += Ll1depth_w
+                Ll1depth += Ll1depth_w.item()
 
-        # 2) Finetune depth loss (combined scene+object render, full depth mask)
+        # 2) Finetune depth (merged render; full-frame supervision; keep 0.1 weight)
         if depth_l1_weight(iteration) > 0 and getattr(ft_viewpoint_cam, "depth_reliable", False):
-            invDepth_ft = ft_render_pkg.get("depth", None)
-            if invDepth_ft is not None and getattr(ft_viewpoint_cam, "invdepthmap", None) is not None:
-                mono_invdepth_ft = ft_viewpoint_cam.invdepthmap.cuda()
-                depth_mask_ft = ft_viewpoint_cam.depth_mask.cuda()
-                ft_Ll1depth_pure = torch.abs((invDepth_ft - mono_invdepth_ft) * depth_mask_ft).mean()
-                ft_Ll1depth = depth_l1_weight(iteration) * ft_Ll1depth_pure
-                loss += 0.1 * ft_Ll1depth
-                Ll1depth += 0.1 * ft_Ll1depth.item()
+            invDepth = ft_render_pkg.get("depth", None)
+            if invDepth is not None and getattr(ft_viewpoint_cam, "invdepthmap", None) is not None:
+                mono_invdepth = ft_viewpoint_cam.invdepthmap.cuda()
+                Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
+                Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
+                loss += 0.1 * Ll1depth_w
+                Ll1depth += 0.1 * Ll1depth_w.item()
 
-        # 3) Object-only depth loss (render object only; supervise on object region only)
+        # 3) Object-only depth (full-frame: use GT where object & reliable depth; elsewhere treated as infinity => 0 in invdepth)
         if depth_l1_weight(iteration) > 0 and getattr(ft_viewpoint_cam, "depth_reliable", False) and (ft_object_mask is not None):
-            invDepth_obj = obj_render_pkg.get("depth", None)
-            if invDepth_obj is not None and getattr(ft_viewpoint_cam, "invdepthmap", None) is not None:
-                mono_invdepth_obj = ft_viewpoint_cam.invdepthmap.cuda()
-                # Use ft depth mask and restrict to object region; outside mask effectively 0 (=inf distance)
+            invDepth = obj_render_pkg.get("depth", None)
+            if invDepth is not None and getattr(ft_viewpoint_cam, "invdepthmap", None) is not None:
+                mono_invdepth = ft_viewpoint_cam.invdepthmap.cuda()
                 depth_mask_obj = ft_viewpoint_cam.depth_mask.cuda() * ft_object_mask
-                obj_Ll1depth_pure = torch.abs((invDepth_obj - mono_invdepth_obj) * depth_mask_obj).mean()
-                obj_Ll1depth = depth_l1_weight(iteration) * obj_Ll1depth_pure
-                loss += 10 * obj_Ll1depth
-                Ll1depth += 10.0 * obj_Ll1depth.item()
+                gt_full = mono_invdepth * depth_mask_obj
+                Ll1depth_pure = torch.abs(invDepth - gt_full).mean()
+                Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
+                loss += 10.0 * Ll1depth_w
+                Ll1depth += 10.0 * Ll1depth_w.item()
 
         loss.backward()
 
@@ -468,11 +466,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (not pruned_this_iter) and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 if not object_only_phase:
-                    # Scene: 使用 scene-only 渲染统计（viewspace_point_tensor, visibility_filter, radii）
+                    # Scene: use scene-only render stats (viewspace_point_tensor, visibility_filter, radii)
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                # Obj: 使用独立渲染结果进行 densify 统计
+                # Obj: use object-only render stats for densification
                 if obj_viewspace_point_tensor.grad is not None:
                     obj_gaussians.max_radii2D[obj_visibility_filter] = torch.max(
                         obj_gaussians.max_radii2D[obj_visibility_filter],

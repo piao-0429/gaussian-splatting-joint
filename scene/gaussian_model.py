@@ -627,10 +627,10 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        # 防御：当切片未保留梯度或该步无梯度时跳过
+        # Guard: skip when the slice didn't retain gradients or this step has no gradients
         if viewspace_point_tensor.grad is None:
             return
-        # 设备对齐，避免 cpu/cuda 掩码不一致
+        # Device alignment to avoid CPU/CUDA mask mismatch
         if self.xyz_gradient_accum.device != update_filter.device:
             update_filter = update_filter.to(self.xyz_gradient_accum.device)
         self.xyz_gradient_accum[update_filter] += torch.norm(
