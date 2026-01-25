@@ -35,7 +35,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
-    mask_path: str
+    mask_paths: list  # One entry per object; empty string if missing
     width: int
     height: int
     is_test: bool
@@ -48,6 +48,7 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
+    num_objects: int
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -72,7 +73,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, ft_masks_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, object_mask_folders, test_cam_names_list):
     cam_infos = []
 
     def find_mask(base_dir: str, image_name: str, stem_name: str):
@@ -134,15 +135,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
         stem_name = extr.name[:-n_remove]
 
-        mask_path = ""
-        # is_finetune = "images_ft" in image_path or "images_ft_obj" in image_path
+        mask_paths = []
         is_finetune = "images_ft" in image_path
         if is_finetune:
-            mask_path = find_mask(ft_masks_folder, extr.name, stem_name)
+            for obj_dir in object_mask_folders:
+                mask_paths.append(find_mask(obj_dir, extr.name, stem_name))
+        else:
+            mask_paths = [""] * len(object_mask_folders)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              mask_path=mask_path,
+                              mask_paths=mask_paths,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
 
@@ -232,13 +235,34 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
             candidate = os.path.join(path, ft_masks)
             ft_masks_dir = candidate if os.path.isdir(candidate) else ""
 
+    object_mask_folders = []
+    if ft_masks_dir:
+        subdirs = [os.path.join(ft_masks_dir, d) for d in sorted(os.listdir(ft_masks_dir)) if os.path.isdir(os.path.join(ft_masks_dir, d))]
+        if subdirs:
+            object_mask_folders = subdirs
+        else:
+            object_mask_folders = [ft_masks_dir]
+
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "",
-        ft_masks_folder=ft_masks_dir,
+        object_mask_folders=object_mask_folders,
         test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    # Report how many masks were found per object-folder
+    if object_mask_folders:
+        counts = [0] * len(object_mask_folders)
+        for c in cam_infos:
+            for i, p in enumerate(c.mask_paths):
+                if p:
+                    counts[i] += 1
+
+        print("[INFO] Finetune mask summary:")
+        for i, folder in enumerate(object_mask_folders):
+            name = os.path.basename(folder.rstrip(os.sep)) or folder
+            print(f"  Object {i}: folder='{folder}' (name='{name}') -> {counts[i]} masks matched")
 
     # train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     # test_cam_infos = [c for c in cam_infos if c.is_test]
@@ -297,7 +321,8 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
                            finetune_cameras=finetune_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           is_nerf_synthetic=False)
+                           is_nerf_synthetic=False,
+                           num_objects=len(object_mask_folders))
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
@@ -349,7 +374,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
                 image_path=image_path,
                 image_name=image_name,
                 depth_path=depth_path,
-                mask_path="",
+                mask_paths=[],
                 width=image.size[0],
                 height=image.size[1],
                 is_test=is_test,
@@ -394,7 +419,8 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            finetune_cameras=[],
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           is_nerf_synthetic=True)
+                           is_nerf_synthetic=True,
+                           num_objects=0)
     return scene_info
 
 sceneLoadTypeCallbacks = {

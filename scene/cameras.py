@@ -17,8 +17,8 @@ from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
-    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, mask_image, invdepthmap,
-                 image_name, uid,
+    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, mask_images=None, invdepthmap=None,
+                 image_name=None, uid=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False
                  ):
@@ -47,15 +47,30 @@ class Camera(nn.Module):
         else: 
             self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
 
-        self.object_mask = None
-        if mask_image is not None:
-            mask_tensor = PILtoTorch(mask_image, resolution)
+        self.object_masks = []
+        if mask_images is None:
+            mask_images = []
+        # Backward compatibility: accept a single mask tensor/image passed in the old arg name
+        if mask_images and not isinstance(mask_images, list):
+            mask_images = [mask_images]
+        for m_img in mask_images:
+            if m_img is None:
+                self.object_masks.append(None)
+                continue
+            mask_tensor = PILtoTorch(m_img, resolution)
             if mask_tensor.dim() == 3 and mask_tensor.shape[0] > 1:
                 mask_tensor = mask_tensor[:1, ...]
             elif mask_tensor.dim() == 2:
                 mask_tensor = mask_tensor.unsqueeze(0)
             mask_tensor = (mask_tensor > 0.5).float()
-            self.object_mask = mask_tensor.to(self.data_device)
+            self.object_masks.append(mask_tensor.to(self.data_device))
+
+        # Convenience: retain the first mask for legacy code paths
+        self.object_mask = None
+        for m in self.object_masks:
+            if m is not None:
+                self.object_mask = m
+                break
 
         if train_test_exp and is_test_view:
             if is_test_dataset:

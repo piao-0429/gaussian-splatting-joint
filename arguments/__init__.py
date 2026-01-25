@@ -102,7 +102,8 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
         self.mask_prune_on_save = False
-        self.mask_prune_min_views = 2
+        # Proportion (0.0-1.0) of available mask views required to keep a Gaussian
+        self.mask_prune_min_prop = 0.5
         self.mask_prune_threshold = 0.5
         self.mask_prune_blur_sigma = 0.0
         super().__init__(parser, "Optimization Parameters")
