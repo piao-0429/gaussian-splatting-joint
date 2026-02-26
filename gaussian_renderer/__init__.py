@@ -173,6 +173,11 @@ def render_debug_mask(viewpoint_camera, pc: GaussianModel, object_mask: torch.Te
     screen_y = torch.clamp(screen_y, 0, height - 1)
 
     mask_cpu = object_mask.squeeze(0).detach().cpu()
+    # Paint mask area green first (keep dtype uint8 canvas)
+    mask_full = (mask_cpu > 0.5).numpy()
+    green = np.array([0, 255, 0], dtype=np.uint8)
+    canvas[mask_full] = green
+
     mask_values = mask_cpu[screen_y.cpu(), screen_x.cpu()] > 0.5
 
     coords = torch.stack([screen_y, screen_x], dim=1).cpu().numpy()

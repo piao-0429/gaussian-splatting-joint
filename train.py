@@ -173,8 +173,9 @@ def prune_gaussians_with_object_masks(gaussians, cameras, mask_prune_min_prop=0.
         computed_threshold = int(math.ceil(prop * n_mask_cams))
         computed_threshold = max(computed_threshold, 1)
 
-    prune_mask = background_counts >= computed_threshold
-    prune_mask = prune_mask | (seen_counts < computed_threshold)
+    # prune_mask = background_counts >= computed_threshold
+    # prune_mask = prune_mask | (seen_counts < computed_threshold)
+    prune_mask = inside_counts < computed_threshold
 
     removed = int(prune_mask.sum().item())
     if removed > 0:

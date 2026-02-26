@@ -21,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from scene.colmap_loader import read_points3D_binary, read_points3D_text
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -393,6 +394,26 @@ class GaussianModel:
     #     self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
     def load_obj_ply(self, path):
+        # ext = os.path.splitext(path)[1].lower()
+        # if ext in (".bin", ".txt"):
+        #     print(f"Obj path: {path}")
+        #     try:
+        #         xyz, rgb, _ = read_points3D_binary(path) if ext == ".bin" else read_points3D_text(path)
+        #     except Exception:
+        #         print(f"Failed to read COLMAP {ext} point cloud at {path}")
+        #         raise
+
+        #     colors = rgb / 255.0
+        #     normals = np.zeros_like(xyz)
+        #     pcd = BasicPointCloud(points=xyz, colors=colors, normals=normals)
+        #     try:
+        #         print("Trying to create from COLMAP point cloud")
+        #         self.create_from_pcd(pcd, [], 1.0)
+        #     except Exception:
+        #         print(f"Exception Occured!")
+        #         exit(1)
+        #     return
+
         plydata = PlyData.read(path)
         print(f"Obj path: {path}")
 
