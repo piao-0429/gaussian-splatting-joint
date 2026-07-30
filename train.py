@@ -63,7 +63,7 @@ def _get_gaussian_kernel(sigma: float, device: torch.device):
     return kernel
 
 
-def prune_gaussians_with_object_masks(gaussians, cameras, mask_prune_min_prop=0.5, mask_threshold=0.5, mask_blur_sigma=0.0, mask_index=0):
+def prune_gaussians_with_object_masks(gaussians, cameras, mask_prune_min_prop=0.5, mask_threshold=0.5, mask_prune_expand=0.0, mask_index=0):
     """Prune Gaussians that fall outside per-view object masks.
 
     Args:
@@ -111,15 +111,15 @@ def prune_gaussians_with_object_masks(gaussians, cameras, mask_prune_min_prop=0.
             mask_tensor = mask_tensor.to(device=device)
         mask_tensor = mask_tensor.to(dtype=torch.float32)
 
-        if mask_blur_sigma > 0:
-            kernel = _get_gaussian_kernel(mask_blur_sigma, mask_tensor.device)
-            pad = kernel.shape[-1] // 2
-            mask_tensor = F.conv2d(
-                mask_tensor.unsqueeze(0).unsqueeze(0),
-                kernel,
-                padding=pad,
+        if mask_prune_expand > 0:
+            radius = max(1, int(math.ceil(mask_prune_expand)))
+            ksize = 2 * radius + 1
+            mask_tensor = F.max_pool2d(
+                (mask_tensor > 0.5).to(dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+                kernel_size=ksize,
+                stride=1,
+                padding=radius,
             ).squeeze(0).squeeze(0)
-            mask_tensor = mask_tensor.clamp(0.0, 1.0)
 
         full_proj = camera.full_proj_transform
         if full_proj.device != device:
@@ -617,7 +617,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     ft_cams_current,
                                     mask_prune_min_prop=opt.mask_prune_min_prop,
                                     mask_threshold=opt.mask_prune_threshold,
-                                    mask_blur_sigma=opt.mask_prune_blur_sigma,
+                                    mask_prune_expand=opt.mask_prune_expand,
                                     mask_index=obj_idx,
                                 )
                                 if pruned > 0:

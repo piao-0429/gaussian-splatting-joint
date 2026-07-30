@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
@@ -8,6 +9,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
+import torchvision
+import json
+from datetime import datetime
 
 try:
     from fused_ssim import fused_ssim
@@ -121,7 +125,7 @@ def render_view(camera, gaussians, pipe, background, train_test_exp, separate_sh
     return pred, gt
 
 
-def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, separate_sh, mask_index=None):
+def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, separate_sh, mask_index=None, gt_mask_index=None, output_root=None, sample_prob=0.02):
     if not cameras:
         print(f"[INFO] Split '{name}' has no cameras; skipping.")
         return {"name": name, "count": 0}
@@ -131,11 +135,24 @@ def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, s
     ssim_sum = 0.0
     count = 0
 
+    split_out_dir = None
+    if output_root is not None:
+        split_out_dir = os.path.join(output_root, name)
+        os.makedirs(split_out_dir, exist_ok=True)
+
     for cam in tqdm(cameras, desc=f"Eval {name}", leave=False):
         rendered = render_view(cam, gaussians, pipe, background, train_test_exp, separate_sh, mask_index)
         if rendered is None:
             continue
         pred, gt = rendered
+        # If caller requested GT masking only, apply mask to GT (keep pred unmasked)
+        if gt_mask_index is not None:
+            masks = getattr(cam, "object_masks", []) or []
+            if gt_mask_index >= len(masks) or masks[gt_mask_index] is None:
+                # no mask available, skip this view
+                continue
+            gt_mask = masks[gt_mask_index].to(gt.device)
+            gt = gt * gt_mask
         l1_val = l1_loss(pred, gt).mean().double()
         psnr_val = psnr(pred, gt).mean().double()
         if FUSED_SSIM_AVAILABLE:
@@ -148,6 +165,15 @@ def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, s
         psnr_sum += psnr_val.item()
         ssim_sum += ssim_val.item()
         count += 1
+
+        # With small probability, dump GT | Pred | AbsDiff for inspection
+        if split_out_dir and random.random() < sample_prob:
+            diff = torch.abs(pred - gt)
+            composite = torch.cat([gt, pred, diff], dim=2)
+            safe_name = cam.image_name.replace("/", "_").replace("\\", "_")
+            fname = f"{safe_name}.png"
+            out_path = os.path.join(split_out_dir, fname)
+            torchvision.utils.save_image(composite, out_path)
 
     if count == 0:
         print(f"[INFO] Split '{name}' had no usable masked views; skipping metrics.")
@@ -178,6 +204,7 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         results = []
+        output_root = os.path.join(dataset.model_path, "eval")
 
         if not skip_train:
             results.append(
@@ -189,6 +216,7 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
+                    output_root=output_root,
                 )
             )
 
@@ -202,6 +230,7 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
+                    output_root=output_root,
                 )
             )
 
@@ -217,6 +246,7 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
+                    output_root=output_root,
                 )
             )
 
@@ -233,6 +263,21 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                             dataset.train_test_exp,
                             SPARSE_ADAM_AVAILABLE,
                             mask_index=obj_idx,
+                            output_root=output_root,
+                        )
+                    )
+                    results.append(
+                        evaluate_split(
+                            f"finetune_obj{obj_idx}_unmasked",
+                            cams_for_obj,
+                            obj_gaussians[obj_idx],
+                            pipe,
+                            background,
+                            dataset.train_test_exp,
+                            SPARSE_ADAM_AVAILABLE,
+                            mask_index=None,
+                            gt_mask_index=obj_idx,
+                            output_root=output_root,
                         )
                     )
 
@@ -255,7 +300,7 @@ if __name__ == "__main__":
 
     safe_state(args.quiet)
 
-    evaluate(
+    results = evaluate(
         lp.extract(args),
         pp.extract(args),
         args.iteration,
@@ -264,3 +309,17 @@ if __name__ == "__main__":
         skip_finetune=args.skip_finetune,
         skip_objects=args.skip_objects,
     )
+
+    # Persist results to JSON under model_path/eval
+    out_dir = os.path.join(args.model_path, "eval")
+    os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, f"metrics_iter{args.iteration}.json")
+    dump = {
+        "model_path": args.model_path,
+        "iteration": args.iteration,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "results": results,
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(dump, f, indent=2)
+    print(f"Wrote metrics to {metrics_path}")

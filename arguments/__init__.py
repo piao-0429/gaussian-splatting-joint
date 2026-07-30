@@ -105,7 +105,8 @@ class OptimizationParams(ParamGroup):
         # Proportion (0.0-1.0) of available mask views required to keep a Gaussian
         self.mask_prune_min_prop = 0.5
         self.mask_prune_threshold = 0.5
-        self.mask_prune_blur_sigma = 0.0
+        # Dilation radius (in pixels) applied to masks before pruning; 0 disables
+        self.mask_prune_expand = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

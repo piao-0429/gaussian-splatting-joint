@@ -17,7 +17,10 @@ from pathlib import Path
 
 import math
 import numpy as np
+import random
+from PIL import Image
 import torch
+import cv2
 from plyfile import PlyData, PlyElement
 
 # Ensure project root is on PYTHONPATH
@@ -34,7 +37,7 @@ from utils.sh_utils import SH2RGB  # noqa: E402
 from train import prune_gaussians_with_object_masks, _get_gaussian_kernel  # noqa: E402
 
 # Local copy to compute prune mask without mutating gaussians (for split saves)
-def compute_prune_mask(gaussians, cameras, mask_prune_min_prop=0.5, mask_threshold=0.5, mask_blur_sigma=0.0, mask_index=0):
+def compute_prune_mask(gaussians, cameras, mask_prune_min_prop=0.5, mask_threshold=0.5, mask_expand=0.0, mask_index=0):
     if gaussians.get_xyz.numel() == 0:
         return torch.zeros_like(gaussians.get_xyz[:, 0], dtype=torch.bool), 0
 
@@ -74,15 +77,13 @@ def compute_prune_mask(gaussians, cameras, mask_prune_min_prop=0.5, mask_thresho
             mask_tensor = mask_tensor.to(device=device)
         mask_tensor = mask_tensor.to(dtype=torch.float32)
 
-        if mask_blur_sigma > 0:
-            kernel = _get_gaussian_kernel(mask_blur_sigma, mask_tensor.device)
-            pad = kernel.shape[-1] // 2
-            mask_tensor = torch.nn.functional.conv2d(
-                mask_tensor.unsqueeze(0).unsqueeze(0),
-                kernel,
-                padding=pad,
-            ).squeeze(0).squeeze(0)
-            mask_tensor = mask_tensor.clamp(0.0, 1.0)
+        if mask_expand > 0:
+            radius = max(1, int(math.ceil(mask_expand)))
+            ksize = 2 * radius + 1
+            kernel = np.ones((ksize, ksize), dtype=np.uint8)
+            mt_np = (mask_tensor.cpu().numpy() > 0.5).astype(np.uint8)
+            dilated = cv2.dilate(mt_np, kernel, iterations=1)
+            mask_tensor = torch.from_numpy(dilated).to(device=device, dtype=torch.float32)
 
         full_proj = camera.full_proj_transform
         if full_proj.device != device:
@@ -184,6 +185,7 @@ def parse_args():
         action="store_true",
         help="Also save the removed (outside-mask) points to output_path/removed as PLYs",
     )
+    # debug masks are exported by default (no CLI flags)
     parser.add_argument(
         "--prune_all_masks",
         action="store_true",
@@ -247,7 +249,7 @@ def parse_args():
     # Expose mask-related options on args for clarity
     args.mask_prune_threshold = opt.mask_prune_threshold
     args.mask_prune_min_prop = opt.mask_prune_min_prop
-    args.mask_prune_blur_sigma = opt.mask_prune_blur_sigma
+    args.mask_prune_expand = getattr(opt, "mask_prune_expand", 0.0)
 
     # Default to prune all masks when not specified
     if not hasattr(args, "prune_all_masks") or args.prune_all_masks is False:
@@ -298,47 +300,6 @@ def load_gaussians(args, dataset, opt, scene_info, cam_infos):
         gaussians.training_setup(opt)
     return gaussians
 
-
-def prune_once(args, cameras, gaussians, output_dir, total_points, mask_label=None, mask_index=0):
-    print("\n[Prune] Mask-based pruning of Gaussian PLY")
-    prune_mask, used_threshold = compute_prune_mask(
-        gaussians,
-        cameras,
-        mask_prune_min_prop=args.mask_prune_min_prop,
-        mask_threshold=args.mask_prune_threshold,
-        mask_blur_sigma=args.mask_prune_blur_sigma,
-        mask_index=mask_index,
-    )
-
-    removed = int(prune_mask.sum().item())
-    kept_mask = (~prune_mask).cpu().numpy().astype(bool)
-    removed_mask = prune_mask.cpu().numpy().astype(bool)
-
-    # Save removed (outer/cut) if requested
-    if getattr(args, "save_removed", False) and removed > 0:
-        cut_dir = os.path.join(output_dir, "removed")
-        prefix = "point3D_removed" if mask_label is None else f"point3D_removed_{mask_label}"
-        cut_colmap, cut_gauss = save_gaussian_subset(gaussians, removed_mask, cut_dir, prefix)
-        print(f"[Prune] Saved removed subset: {cut_colmap}, {cut_gauss}")
-
-    # Apply pruning to gaussians in-place for kept cloud
-    if removed > 0:
-        if not hasattr(gaussians, "tmp_radii") or gaussians.tmp_radii is None or gaussians.tmp_radii.shape[0] != gaussians.get_xyz.shape[0]:
-            gaussians.tmp_radii = gaussians.get_xyz.new_zeros((gaussians.get_xyz.shape[0],))
-        gaussians.prune_points(prune_mask)
-        gaussians.tmp_radii = None
-
-    kept = gaussians.get_xyz.shape[0]
-
-    print(f"[Prune] Removed {removed} points (kept {kept}/{total_points}, threshold={used_threshold} mask views)")
-
-    colmap_ply_path, gaussian_ply_path = save_outputs(gaussians, output_dir)
-
-    print(f"Total: {total_points}, removed: {removed}, kept: {kept}, threshold_used: {used_threshold}")
-    print(f"COLMAP PLY: {colmap_ply_path}")
-    print(f"Gaussian PLY: {gaussian_ply_path}")
-
-
 def prune_all_masks(args, dataset, opt, scene_info, cam_infos, cameras):
     max_masks = _max_mask_slots(cameras)
     if max_masks == 0:
@@ -366,9 +327,79 @@ def prune_all_masks(args, dataset, opt, scene_info, cam_infos, cameras):
             cameras,
             mask_prune_min_prop=args.mask_prune_min_prop,
             mask_threshold=args.mask_prune_threshold,
-            mask_blur_sigma=args.mask_prune_blur_sigma,
+            mask_expand=args.mask_prune_expand,
             mask_index=idx,
         )
+
+        # --- Debug export: default ON, export up to 10 random mask views per slot ---
+        try:
+            debug_dir = os.path.join(args.output_path, "debug_mask")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            # collect cameras that have the current mask slot
+            mask_cameras = []
+            mask_cam_indices = []
+            for ci, cam in enumerate(cameras):
+                masks = getattr(cam, "object_masks", None)
+                if isinstance(masks, list):
+                    if idx < len(masks) and masks[idx] is not None:
+                        mask_cameras.append(cam)
+                        mask_cam_indices.append(ci)
+                elif getattr(cam, "object_mask", None) is not None:
+                    mask_cameras.append(cam)
+                    mask_cam_indices.append(ci)
+
+            n_export = min(len(mask_cameras), 10)
+            if n_export > 0:
+                sampled = random.sample(range(len(mask_cameras)), n_export)
+                for m_idx in sampled:
+                    cam = mask_cameras[m_idx]
+                    orig_cam_idx = mask_cam_indices[m_idx]
+
+                    # get mask tensor for this slot
+                    mask_tensor = None
+                    masks = getattr(cam, "object_masks", None)
+                    if isinstance(masks, list) and idx < len(masks):
+                        mask_tensor = masks[idx]
+                    if mask_tensor is None:
+                        mask_tensor = getattr(cam, "object_mask", None)
+                    if mask_tensor is None:
+                        continue
+
+                    mt = mask_tensor.squeeze(0)
+                    if mt.device.type != 'cpu':
+                        mt = mt.to(device="cpu")
+                    mt = mt.to(dtype=torch.float32)
+
+                    width = int(getattr(cam, "image_width", mt.shape[1]))
+                    height = int(getattr(cam, "image_height", mt.shape[0]))
+
+                    # Composite image (single file): start black, paint blurred mask white, then paint original mask black
+                    if getattr(args, "mask_prune_expand", 0.0) > 0:
+                        radius = max(1, int(math.ceil(args.mask_prune_expand)))
+                        ksize = 2 * radius + 1
+                        kernel = np.ones((ksize, ksize), dtype=np.uint8)
+                        mt_np = (mt.numpy() > 0.5).astype(np.uint8)
+                        dilated = cv2.dilate(mt_np, kernel, iterations=1)
+                        expanded = dilated.astype(np.uint8)
+                    else:
+                        expanded = (mt.numpy() > 0.5).astype(np.uint8)
+
+                    # binary masks
+                    blurred_bool = expanded.astype(bool)
+                    orig_bool = (mask_tensor.squeeze(0).cpu().numpy() > 0.5)
+
+                    # build composite: black background
+                    composite = np.zeros((height, width), dtype=np.uint8)
+                    # paint blurred areas white
+                    composite[blurred_bool] = 255
+                    # then paint original mask areas black (overwrite)
+                    composite[orig_bool] = 0
+
+                    Image.fromarray(composite).save(os.path.join(debug_dir, f"slot{idx:02d}_cam_{orig_cam_idx:04d}_combined.png"))
+        except Exception:
+            # non-fatal: do not stop pruning if debug export fails
+            pass
 
         removed = int(prune_mask.sum().item())
         # object mask = points considered inside the object (not removed by prune_mask)
