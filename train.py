@@ -13,17 +13,15 @@ import os
 import math
 import torch
 import torch.nn.functional as F
-import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, render_debug_mask, network_gui
+from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from PIL import Image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -226,7 +224,7 @@ def merge_gaussians(gaussians):
 
     return merged_gaussians
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -256,23 +254,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Keep the first object model wired into the scene for compatibility with existing save/report hooks
     scene.obj_gaussians = obj_gaussians_list[0]
 
-    # Create finetune debug mask directory in the output model path
-    ft_debug_mask_dir = None
-    try:
-        finetune_cameras_all = scene.getFinetuneCameras()
-        if finetune_cameras_all:
-            def _has_any_mask(cam):
-                masks = getattr(cam, "object_masks", None)
-                if isinstance(masks, list):
-                    return any(m is not None for m in masks)
-                return getattr(cam, "object_mask", None) is not None
-
-            if any(_has_any_mask(cam) for cam in finetune_cameras_all):
-                ft_debug_mask_dir = os.path.join(dataset.model_path, "ft_debug_mask")
-                os.makedirs(ft_debug_mask_dir, exist_ok=True)
-    except Exception:
-        pass
-    
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -343,6 +324,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # if iteration % 1000 == 0:
         #     gaussians.oneupSHdegree()
 
+        # Before a certain iteration, train only the object branches.
+        object_only_phase = (iteration < getattr(opt, "object_only_until_iter", 0))
+
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -352,7 +336,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not ft_viewpoint_stacks[obj_idx]:
                 ft_viewpoint_stacks[obj_idx] = ft_viewpoint_pools[obj_idx].copy()
                 ft_viewpoint_indices[obj_idx] = list(range(len(ft_viewpoint_stacks[obj_idx])))
-        if not ft_global_stack:
+        if not object_only_phase and not ft_global_stack:
             ft_global_stack = ft_cameras_all.copy()
             ft_global_indices = list(range(len(ft_global_stack)))
 
@@ -360,10 +344,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
 
-        # Sample a global finetune camera (scene + all objects merged view)
-        ft_global_rand = randint(0, len(ft_global_indices) - 1)
-        ft_global_cam = ft_global_stack.pop(ft_global_rand)
-        ft_global_indices.pop(ft_global_rand)
+        # The global finetune camera is unused during object-only pretraining.
+        ft_global_cam = None
+        if not object_only_phase and ft_global_indices:
+            ft_global_rand = randint(0, len(ft_global_indices) - 1)
+            ft_global_cam = ft_global_stack.pop(ft_global_rand)
+            ft_global_indices.pop(ft_global_rand)
 
         obj_viewpoint_cams = []
         for obj_idx in range(num_objects):
@@ -381,9 +367,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        # Before a certain iteration, train only the object branch
-        object_only_phase = (iteration < getattr(opt, "object_only_until_iter", 0))
-
         # If we just finished the object-only phase, re-run finetuning setup for the object model
         # to reset its optimizer state and accumulators before joint training starts.
         if (getattr(opt, "object_only_until_iter", 0) > 0) and (iteration == getattr(opt, "object_only_until_iter", 0)):
@@ -395,11 +378,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         render_pkg = {}
         viewspace_point_tensor = visibility_filter = radii = None
-        # Finetune merged renders per object (scene + that object)
-        ft_render_pkgs = [None] * num_objects
-        ft_images = [None] * num_objects
-        ft_gt_images = [None] * num_objects
-        # Global finetune (scene + all objects merged) using any ft view
+        # The global finetune render supplies both composed RGB and depth.
         ft_global_pkg = None
         ft_global_image = None
         ft_global_gt = None
@@ -458,43 +437,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             obj_visibility_filters[obj_idx] = obj_render_pkg.get("visibility_filter")
             obj_radii_list[obj_idx] = obj_render_pkg.get("radii")
 
-            if not object_only_phase:
-                ft_pkg = render(cam, merge_gaussians([gaussians, obj_gaussians_list[obj_idx]]), pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-                ft_img = ft_pkg["render"]
-                if cam.alpha_mask is not None:
-                    ft_img *= cam.alpha_mask
-                ft_gt = cam.original_image.cuda()
-                if obj_mask is not None:
-                    mask_tensor = obj_mask.to(ft_img.device)
-                    ft_img = ft_img * mask_tensor
-                    ft_gt = ft_gt * mask_tensor
-
-                ft_render_pkgs[obj_idx] = ft_pkg
-                ft_images[obj_idx] = ft_img
-                ft_gt_images[obj_idx] = ft_gt
-
-                if ft_debug_mask_dir and (iteration % 500 == 0) and obj_mask is not None:
-                    debug_image = render_debug_mask(cam, obj_gaussians_list[obj_idx], obj_mask)
-
-                    ft_gt_image_np = (
-                        cam.original_image
-                        .detach()
-                        .clamp(0.0, 1.0)
-                        .cpu()
-                        .permute(1, 2, 0)
-                        .numpy()
-                    )
-                    ft_gt_image_np = (ft_gt_image_np * 255.0).astype(np.uint8)
-
-                    mask_np = obj_mask.detach().cpu().squeeze(0).numpy()
-                    mask_rgb = (np.stack([mask_np, mask_np, mask_np], axis=2) * 255.0).astype(np.uint8)
-
-                    composite = np.concatenate([ft_gt_image_np, mask_rgb, debug_image], axis=1)
-                    debug_path = os.path.join(ft_debug_mask_dir, f"iter_{iteration:06d}_{cam.image_name}_obj{obj_idx}.png")
-                    Image.fromarray(composite).save(debug_path)
-
         # Loss
         active_obj_indices = [i for i, cam in enumerate(obj_viewpoint_cams) if cam is not None]
+        scene_weight = 1.0
+        composed_weight = 0.1
+        object_weight = 10.0
 
         if object_only_phase:
             l1_terms = []
@@ -517,22 +464,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = torch.tensor(0.0, device=gaussians.get_xyz.device)
         else:
             gt_image = viewpoint_cam.original_image.cuda()
-            base_weight = 1.0
-            ft_weight = 0.1
-            obj_weight = 10.0
 
-            Ll1_num = base_weight * l1_loss(image, gt_image)
-            denom = base_weight
+            Ll1_num = scene_weight * l1_loss(image, gt_image)
+            denom = scene_weight
 
             # Global finetune term: scene + all objects merged
             if ft_global_image is not None and ft_global_gt is not None:
-                Ll1_num += ft_weight * l1_loss(ft_global_image, ft_global_gt)
-                denom += ft_weight
+                Ll1_num += composed_weight * l1_loss(ft_global_image, ft_global_gt)
+                denom += composed_weight
 
             for idx in active_obj_indices:
                 if obj_images[idx] is not None and obj_gt_images[idx] is not None:
-                    Ll1_num += obj_weight * l1_loss(obj_images[idx], obj_gt_images[idx])
-                    denom += obj_weight
+                    Ll1_num += object_weight * l1_loss(obj_images[idx], obj_gt_images[idx])
+                    denom += object_weight
 
             Ll1 = Ll1_num / denom
 
@@ -545,37 +489,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Depth regularization (clean, unified style)
-        Ll1depth = 0.0
+        # Depth regularization follows the same three supervision levels as RGB:
+        # scene-only, scene + all objects, and each object in isolation.
+        depth_terms_for_log = []
+        current_depth_weight = depth_l1_weight(iteration)
 
-        # 1) Scene depth (full-frame supervision; compare predicted invdepth to full GT)
-        if depth_l1_weight(iteration) > 0 and getattr(viewpoint_cam, "depth_reliable", False):
+        # 1) Scene-only depth.
+        if current_depth_weight > 0 and not object_only_phase and getattr(viewpoint_cam, "depth_reliable", False):
             invDepth = render_pkg.get("depth", None)
             if invDepth is not None and getattr(viewpoint_cam, "invdepthmap", None) is not None:
                 mono_invdepth = viewpoint_cam.invdepthmap.cuda()
                 Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
-                Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
+                Ll1depth_w = current_depth_weight * Ll1depth_pure
                 loss += Ll1depth_w
-                Ll1depth += Ll1depth_w.item()
+                depth_terms_for_log.append(Ll1depth_w.detach())
 
-        # 2) Finetune depth (merged render; full-frame supervision; keep 0.1 weight) and object-only depth per object
-        if depth_l1_weight(iteration) > 0:
+        # 2) Composed depth, reusing the scene + all-objects RGB render.
+        if (
+            current_depth_weight > 0
+            and ft_global_pkg is not None
+            and ft_global_cam is not None
+            and getattr(ft_global_cam, "depth_reliable", False)
+            and getattr(ft_global_cam, "invdepthmap", None) is not None
+        ):
+            invDepth = ft_global_pkg.get("depth", None)
+            if invDepth is not None:
+                mono_invdepth = ft_global_cam.invdepthmap.cuda()
+                Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
+                Ll1depth_w = composed_weight * current_depth_weight * Ll1depth_pure
+                loss += Ll1depth_w
+                depth_terms_for_log.append(Ll1depth_w.detach())
+
+        # 3) Object-only masked depth for each object.
+        if current_depth_weight > 0:
             for idx in active_obj_indices:
                 cam = obj_viewpoint_cams[idx]
                 if cam is None:
                     continue
 
-                # Finetune depth (scene + object_i) using that object's ft camera
-                if ft_render_pkgs[idx] is not None and getattr(cam, "depth_reliable", False):
-                    invDepth = ft_render_pkgs[idx].get("depth", None)
-                    if invDepth is not None and getattr(cam, "invdepthmap", None) is not None:
-                        mono_invdepth = cam.invdepthmap.cuda()
-                        Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
-                        Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
-                        loss += 0.1 * Ll1depth_w
-                        Ll1depth += 0.1 * Ll1depth_w.item()
-
-                # Object-only depth with mask
                 obj_mask = obj_masks_used[idx]
                 if obj_render_pkgs[idx] is not None and getattr(cam, "depth_reliable", False) and (obj_mask is not None):
                     invDepth = obj_render_pkgs[idx].get("depth", None)
@@ -584,11 +535,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         depth_mask_obj = cam.depth_mask.cuda() * obj_mask
                         gt_full = mono_invdepth * depth_mask_obj
                         Ll1depth_pure = torch.abs(invDepth - gt_full).mean()
-                        Ll1depth_w = depth_l1_weight(iteration) * Ll1depth_pure
-                        loss += 10.0 * Ll1depth_w
-                        Ll1depth += 10.0 * Ll1depth_w.item()
+                        Ll1depth_w = object_weight * current_depth_weight * Ll1depth_pure
+                        loss += Ll1depth_w
+                        depth_terms_for_log.append(Ll1depth_w.detach())
 
         loss.backward()
+        Ll1depth = torch.stack(depth_terms_for_log).sum().item() if depth_terms_for_log else 0.0
 
         iter_end.record()
 
@@ -604,29 +556,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
+            # Log, prune, and save. Pruning deliberately comes before saving so
+            # coincident prune/save iterations persist the already-pruned models.
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
-                pruned = 0
+            if iteration in pruning_iterations:
                 ft_cams_current = scene.getFinetuneCameras()
-                if opt.mask_prune_on_save and ft_cams_current and (iteration != 30_000):
-                    print("\n[ITER {}] Mask-based pruning of scene Gaussians".format(iteration))
+                if ft_cams_current:
+                    print("\n[ITER {}] Mask-based pruning of object Gaussians".format(iteration))
                     for obj_idx, obj_g in enumerate(obj_gaussians_list):
-                                pruned, used_threshold = prune_gaussians_with_object_masks(
-                                    obj_g,
-                                    ft_cams_current,
-                                    mask_prune_min_prop=opt.mask_prune_min_prop,
-                                    mask_threshold=opt.mask_prune_threshold,
-                                    mask_prune_expand=opt.mask_prune_expand,
-                                    mask_index=obj_idx,
-                                )
-                                if pruned > 0:
-                                    pruned_this_iter = True
-                                    print("\n[ITER {}] Mask pruning removed {} object Gaussians for obj {} (used threshold={} views)".format(iteration, pruned, obj_idx, used_threshold))
-                else :
-                    print("\n[ITER {}] Skipping mask-based pruning of scene Gaussians".format(iteration))
-                
-                
+                        pruned, used_threshold = prune_gaussians_with_object_masks(
+                            obj_g,
+                            ft_cams_current,
+                            mask_prune_min_prop=opt.mask_prune_min_prop,
+                            mask_threshold=opt.mask_prune_threshold,
+                            mask_prune_expand=opt.mask_prune_expand,
+                            mask_index=obj_idx,
+                        )
+                        if pruned > 0:
+                            pruned_this_iter = True
+                            print("\n[ITER {}] Mask pruning removed {} object Gaussians for obj {} (used threshold={} views)".format(iteration, pruned, obj_idx, used_threshold))
+                else:
+                    print("\n[ITER {}] Skipping mask-based pruning: no finetune cameras available".format(iteration))
+
+            if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 # Persist additional object gaussians (obj_0 already saved via scene.save)
@@ -774,6 +726,15 @@ if __name__ == "__main__":
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 10_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 30_000])
+    # Recommended: include the final training iteration so the final save is
+    # written immediately after mask-based object pruning.
+    parser.add_argument(
+        "--prune_iterations",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Iterations for mask-based object pruning. Include the final training iteration to prune immediately before the final save.",
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -790,7 +751,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.prune_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")
