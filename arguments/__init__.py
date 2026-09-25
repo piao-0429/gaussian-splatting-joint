@@ -101,6 +101,10 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # After object-only pretraining, sample one balanced supervision mode
+        # (background, composed, or all-objects) per optimization step.
+        self.stochastic_tri_level = False
+        self.tri_level_seed = 0
         # Proportion (0.0-1.0) of available mask views required to keep a Gaussian
         self.mask_prune_min_prop = 0.5
         self.mask_prune_threshold = 0.5

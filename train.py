@@ -13,7 +13,7 @@ import os
 import math
 import torch
 import torch.nn.functional as F
-from random import randint
+from random import randint, Random
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -297,6 +297,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     scene_optim_initialized = False
+    stochastic_tri_level = bool(getattr(opt, "stochastic_tri_level", False))
+    tri_level_rng = Random(int(getattr(opt, "tri_level_seed", 0)))
+    tri_level_queue = []
+    tri_level_counts = {"background": 0, "composed": 0, "objects": 0}
+    scene_isolated_exposures = 0
+    object_isolated_exposures = [0] * num_objects
+
+    if stochastic_tri_level:
+        if not viewpoint_stack:
+            raise ValueError("Stochastic tri-level training requires background cameras.")
+        if not ft_cameras_all:
+            raise ValueError("Stochastic tri-level training requires composed/finetune cameras.")
+        missing_object_pools = [idx for idx, pool in enumerate(ft_viewpoint_pools) if not pool]
+        if missing_object_pools:
+            raise ValueError(
+                "Stochastic tri-level training requires masked cameras for every object; "
+                f"missing object indices: {missing_object_pools}"
+            )
+        print(
+            "[INFO] Stochastic tri-level enabled after object-only pretraining: "
+            "balanced shuffled schedule (background/composed/all-objects = 1/3 each)."
+        )
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -327,39 +349,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
         # Before a certain iteration, train only the object branches.
         object_only_phase = (iteration < getattr(opt, "object_only_until_iter", 0))
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        # Refresh per-object finetune stacks when empty
-        for obj_idx in range(num_objects):
-            if not ft_viewpoint_stacks[obj_idx]:
-                ft_viewpoint_stacks[obj_idx] = ft_viewpoint_pools[obj_idx].copy()
-                ft_viewpoint_indices[obj_idx] = list(range(len(ft_viewpoint_stacks[obj_idx])))
-        if not object_only_phase and not ft_global_stack:
-            ft_global_stack = ft_cameras_all.copy()
-            ft_global_indices = list(range(len(ft_global_stack)))
+        if object_only_phase:
+            tri_level_mode = "objects"
+        elif stochastic_tri_level:
+            if not tri_level_queue:
+                tri_level_queue = ["background", "composed", "objects"]
+                tri_level_rng.shuffle(tri_level_queue)
+            tri_level_mode = tri_level_queue.pop()
+            tri_level_counts[tri_level_mode] += 1
+        else:
+            tri_level_mode = "all"
 
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        render_background = (not object_only_phase) and tri_level_mode in ("all", "background")
+        render_composed = (not object_only_phase) and tri_level_mode in ("all", "composed")
+        render_objects = object_only_phase or tri_level_mode in ("all", "objects")
 
-        # The global finetune camera is unused during object-only pretraining.
+        viewpoint_cam = None
+        if render_background:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_indices = list(range(len(viewpoint_stack)))
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            viewpoint_indices.pop(rand_idx)
+
         ft_global_cam = None
-        if not object_only_phase and ft_global_indices:
+        if render_composed and ft_cameras_all:
+            if not ft_global_stack:
+                ft_global_stack = ft_cameras_all.copy()
+                ft_global_indices = list(range(len(ft_global_stack)))
             ft_global_rand = randint(0, len(ft_global_indices) - 1)
             ft_global_cam = ft_global_stack.pop(ft_global_rand)
             ft_global_indices.pop(ft_global_rand)
 
-        obj_viewpoint_cams = []
-        for obj_idx in range(num_objects):
-            if not ft_viewpoint_stacks[obj_idx]:
-                obj_viewpoint_cams.append(None)
-                continue
-            ft_rand_idx = randint(0, len(ft_viewpoint_indices[obj_idx]) - 1)
-            cam_sel = ft_viewpoint_stacks[obj_idx].pop(ft_rand_idx)
-            ft_viewpoint_indices[obj_idx].pop(ft_rand_idx)
-            obj_viewpoint_cams.append(cam_sel)
+        obj_viewpoint_cams = [None] * num_objects
+        if render_objects:
+            for obj_idx in range(num_objects):
+                if not ft_viewpoint_stacks[obj_idx]:
+                    ft_viewpoint_stacks[obj_idx] = ft_viewpoint_pools[obj_idx].copy()
+                    ft_viewpoint_indices[obj_idx] = list(range(len(ft_viewpoint_stacks[obj_idx])))
+                if not ft_viewpoint_stacks[obj_idx]:
+                    continue
+                ft_rand_idx = randint(0, len(ft_viewpoint_indices[obj_idx]) - 1)
+                obj_viewpoint_cams[obj_idx] = ft_viewpoint_stacks[obj_idx].pop(ft_rand_idx)
+                ft_viewpoint_indices[obj_idx].pop(ft_rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -383,19 +416,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
         ft_global_image = None
         ft_global_gt = None
 
-        if not object_only_phase:
+        if render_background:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image = render_pkg["render"]
             viewspace_point_tensor = render_pkg["viewspace_points"]
             visibility_filter = render_pkg["visibility_filter"]
             radii = render_pkg["radii"]
 
-        if (not object_only_phase) and (viewpoint_cam.alpha_mask is not None):
+        if render_background and (viewpoint_cam.alpha_mask is not None):
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
         # Global ft render: scene + all objects merged, using the sampled ft_global_cam
-        if not object_only_phase and ft_global_cam is not None:
+        if render_composed and ft_global_cam is not None:
             merged_all = merge_gaussians([gaussians] + obj_gaussians_list)
             ft_global_pkg = render(ft_global_cam, merged_all, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             ft_global_image = ft_global_pkg["render"]
@@ -439,9 +472,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
 
         # Loss
         active_obj_indices = [i for i, cam in enumerate(obj_viewpoint_cams) if cam is not None]
+        if render_background:
+            scene_isolated_exposures += 1
+        if render_objects:
+            for idx in active_obj_indices:
+                object_isolated_exposures[idx] += 1
+
         scene_weight = 1.0
         composed_weight = 0.1
         object_weight = 10.0
+        normalization = scene_weight + composed_weight + num_objects * object_weight
+        current_depth_weight = depth_l1_weight(iteration)
+        depth_terms_for_log = []
 
         if object_only_phase:
             l1_terms = []
@@ -462,6 +504,128 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
             else:
                 Ll1 = torch.tensor(0.0, device=gaussians.get_xyz.device)
                 ssim_value = torch.tensor(0.0, device=gaussians.get_xyz.device)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+            # Preserve the existing object-only depth objective.
+            if current_depth_weight > 0:
+                for idx in active_obj_indices:
+                    cam = obj_viewpoint_cams[idx]
+                    obj_mask = obj_masks_used[idx]
+                    if (
+                        obj_render_pkgs[idx] is not None
+                        and getattr(cam, "depth_reliable", False)
+                        and obj_mask is not None
+                        and getattr(cam, "invdepthmap", None) is not None
+                    ):
+                        inv_depth = obj_render_pkgs[idx].get("depth", None)
+                        if inv_depth is not None:
+                            mono_invdepth = cam.invdepthmap.cuda()
+                            depth_mask_obj = cam.depth_mask.cuda() * obj_mask
+                            gt_full = mono_invdepth * depth_mask_obj
+                            depth_raw = torch.abs(inv_depth - gt_full).mean()
+                            depth_term = object_weight * current_depth_weight * depth_raw
+                            loss += depth_term
+                            depth_terms_for_log.append(depth_term.detach())
+
+        elif stochastic_tri_level:
+            # A shuffled triplet makes q(background)=q(composed)=q(objects)=1/3.
+            # Dividing each selected branch contribution by q=1/3 preserves,
+            # in expectation, the exact loss implemented by the deterministic
+            # joint phase. The current coefficient ratio is
+            # composed:background:objects = 0.1:1:10 = 1:10:100.
+            importance_scale = 3.0
+
+            if tri_level_mode == "background":
+                gt_image = viewpoint_cam.original_image.cuda()
+                l1_raw = l1_loss(image, gt_image)
+                Ll1 = importance_scale * scene_weight / normalization * l1_raw
+
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                else:
+                    ssim_value = ssim(image, gt_image)
+                ssim_value = torch.clamp(ssim_value, 0.0, 1.0)
+
+                # In the deterministic implementation SSIM belongs only to
+                # the background branch, so its whole contribution receives
+                # the inverse-probability correction here.
+                loss = (
+                    (1.0 - opt.lambda_dssim) * Ll1
+                    + importance_scale * opt.lambda_dssim * (1.0 - ssim_value)
+                )
+
+                if (
+                    current_depth_weight > 0
+                    and getattr(viewpoint_cam, "depth_reliable", False)
+                    and getattr(viewpoint_cam, "invdepthmap", None) is not None
+                ):
+                    inv_depth = render_pkg.get("depth", None)
+                    if inv_depth is not None:
+                        mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+                        depth_raw = torch.abs(inv_depth - mono_invdepth).mean()
+                        depth_term = importance_scale * scene_weight * current_depth_weight * depth_raw
+                        loss += depth_term
+                        depth_terms_for_log.append(depth_term.detach())
+
+            elif tri_level_mode == "composed":
+                l1_raw = l1_loss(ft_global_image, ft_global_gt)
+                Ll1 = importance_scale * composed_weight / normalization * l1_raw
+                ssim_value = torch.ones((), device=gaussians.get_xyz.device)
+                loss = (1.0 - opt.lambda_dssim) * Ll1
+
+                if (
+                    current_depth_weight > 0
+                    and getattr(ft_global_cam, "depth_reliable", False)
+                    and getattr(ft_global_cam, "invdepthmap", None) is not None
+                ):
+                    inv_depth = ft_global_pkg.get("depth", None)
+                    if inv_depth is not None:
+                        mono_invdepth = ft_global_cam.invdepthmap.cuda()
+                        depth_raw = torch.abs(inv_depth - mono_invdepth).mean()
+                        depth_term = importance_scale * composed_weight * current_depth_weight * depth_raw
+                        loss += depth_term
+                        depth_terms_for_log.append(depth_term.detach())
+
+            elif tri_level_mode == "objects":
+                l1_terms = [
+                    l1_loss(obj_images[idx], obj_gt_images[idx])
+                    for idx in active_obj_indices
+                    if obj_images[idx] is not None and obj_gt_images[idx] is not None
+                ]
+                if not l1_terms:
+                    raise RuntimeError("All-objects stochastic step has no valid object renders.")
+                l1_raw = torch.stack(l1_terms).sum()
+                Ll1 = importance_scale * object_weight / normalization * l1_raw
+                ssim_value = torch.ones((), device=gaussians.get_xyz.device)
+                loss = (1.0 - opt.lambda_dssim) * Ll1
+
+                if current_depth_weight > 0:
+                    for idx in active_obj_indices:
+                        cam = obj_viewpoint_cams[idx]
+                        obj_mask = obj_masks_used[idx]
+                        if (
+                            obj_render_pkgs[idx] is not None
+                            and getattr(cam, "depth_reliable", False)
+                            and obj_mask is not None
+                            and getattr(cam, "invdepthmap", None) is not None
+                        ):
+                            inv_depth = obj_render_pkgs[idx].get("depth", None)
+                            if inv_depth is not None:
+                                mono_invdepth = cam.invdepthmap.cuda()
+                                depth_mask_obj = cam.depth_mask.cuda() * obj_mask
+                                gt_full = mono_invdepth * depth_mask_obj
+                                depth_raw = torch.abs(inv_depth - gt_full).mean()
+                                depth_term = (
+                                    importance_scale
+                                    * object_weight
+                                    * current_depth_weight
+                                    * depth_raw
+                                )
+                                loss += depth_term
+                                depth_terms_for_log.append(depth_term.detach())
+            else:
+                raise RuntimeError(f"Unknown stochastic tri-level mode: {tri_level_mode}")
+
         else:
             gt_image = viewpoint_cam.original_image.cuda()
 
@@ -486,58 +650,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
                 ssim_scene = ssim(image, gt_image)
 
             ssim_value = torch.clamp(ssim_scene, 0.0, 1.0)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            # Deterministic tri-level depth: scene-only, composed, and every
+            # isolated object. This path remains the unchanged baseline.
+            if current_depth_weight > 0 and getattr(viewpoint_cam, "depth_reliable", False):
+                inv_depth = render_pkg.get("depth", None)
+                if inv_depth is not None and getattr(viewpoint_cam, "invdepthmap", None) is not None:
+                    mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+                    depth_raw = torch.abs(inv_depth - mono_invdepth).mean()
+                    depth_term = scene_weight * current_depth_weight * depth_raw
+                    loss += depth_term
+                    depth_terms_for_log.append(depth_term.detach())
 
-        # Depth regularization follows the same three supervision levels as RGB:
-        # scene-only, scene + all objects, and each object in isolation.
-        depth_terms_for_log = []
-        current_depth_weight = depth_l1_weight(iteration)
+            if (
+                current_depth_weight > 0
+                and ft_global_pkg is not None
+                and ft_global_cam is not None
+                and getattr(ft_global_cam, "depth_reliable", False)
+                and getattr(ft_global_cam, "invdepthmap", None) is not None
+            ):
+                inv_depth = ft_global_pkg.get("depth", None)
+                if inv_depth is not None:
+                    mono_invdepth = ft_global_cam.invdepthmap.cuda()
+                    depth_raw = torch.abs(inv_depth - mono_invdepth).mean()
+                    depth_term = composed_weight * current_depth_weight * depth_raw
+                    loss += depth_term
+                    depth_terms_for_log.append(depth_term.detach())
 
-        # 1) Scene-only depth.
-        if current_depth_weight > 0 and not object_only_phase and getattr(viewpoint_cam, "depth_reliable", False):
-            invDepth = render_pkg.get("depth", None)
-            if invDepth is not None and getattr(viewpoint_cam, "invdepthmap", None) is not None:
-                mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-                Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
-                Ll1depth_w = current_depth_weight * Ll1depth_pure
-                loss += Ll1depth_w
-                depth_terms_for_log.append(Ll1depth_w.detach())
-
-        # 2) Composed depth, reusing the scene + all-objects RGB render.
-        if (
-            current_depth_weight > 0
-            and ft_global_pkg is not None
-            and ft_global_cam is not None
-            and getattr(ft_global_cam, "depth_reliable", False)
-            and getattr(ft_global_cam, "invdepthmap", None) is not None
-        ):
-            invDepth = ft_global_pkg.get("depth", None)
-            if invDepth is not None:
-                mono_invdepth = ft_global_cam.invdepthmap.cuda()
-                Ll1depth_pure = torch.abs(invDepth - mono_invdepth).mean()
-                Ll1depth_w = composed_weight * current_depth_weight * Ll1depth_pure
-                loss += Ll1depth_w
-                depth_terms_for_log.append(Ll1depth_w.detach())
-
-        # 3) Object-only masked depth for each object.
-        if current_depth_weight > 0:
-            for idx in active_obj_indices:
-                cam = obj_viewpoint_cams[idx]
-                if cam is None:
-                    continue
-
-                obj_mask = obj_masks_used[idx]
-                if obj_render_pkgs[idx] is not None and getattr(cam, "depth_reliable", False) and (obj_mask is not None):
-                    invDepth = obj_render_pkgs[idx].get("depth", None)
-                    if invDepth is not None and getattr(cam, "invdepthmap", None) is not None:
-                        mono_invdepth = cam.invdepthmap.cuda()
-                        depth_mask_obj = cam.depth_mask.cuda() * obj_mask
-                        gt_full = mono_invdepth * depth_mask_obj
-                        Ll1depth_pure = torch.abs(invDepth - gt_full).mean()
-                        Ll1depth_w = object_weight * current_depth_weight * Ll1depth_pure
-                        loss += Ll1depth_w
-                        depth_terms_for_log.append(Ll1depth_w.detach())
+            if current_depth_weight > 0:
+                for idx in active_obj_indices:
+                    cam = obj_viewpoint_cams[idx]
+                    obj_mask = obj_masks_used[idx]
+                    if (
+                        obj_render_pkgs[idx] is not None
+                        and getattr(cam, "depth_reliable", False)
+                        and obj_mask is not None
+                        and getattr(cam, "invdepthmap", None) is not None
+                    ):
+                        inv_depth = obj_render_pkgs[idx].get("depth", None)
+                        if inv_depth is not None:
+                            mono_invdepth = cam.invdepthmap.cuda()
+                            depth_mask_obj = cam.depth_mask.cuda() * obj_mask
+                            gt_full = mono_invdepth * depth_mask_obj
+                            depth_raw = torch.abs(inv_depth - gt_full).mean()
+                            depth_term = object_weight * current_depth_weight * depth_raw
+                            loss += depth_term
+                            depth_terms_for_log.append(depth_term.detach())
 
         loss.backward()
         Ll1depth = torch.stack(depth_terms_for_log).sum().item() if depth_terms_for_log else 0.0
@@ -551,7 +710,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_values = {
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
+                }
+                if stochastic_tri_level and not object_only_phase:
+                    progress_values["Mode"] = tri_level_mode
+                progress_bar.set_postfix(progress_values)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -588,21 +753,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
                     suffix = "obj.ply" if obj_idx == 0 else f"obj_{obj_idx}.ply"
                     obj_g.save_ply(os.path.join(point_cloud_path, suffix))
 
-            # Densification
-            if (not pruned_this_iter) and iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                if not object_only_phase:
-                    # Scene: use scene-only render stats (viewspace_point_tensor, visibility_filter, radii)
+            # Densification only consumes isolated-render statistics. In the
+            # stochastic path, virtual per-model iterations preserve roughly
+            # the same number of useful observations as the deterministic
+            # schedule instead of keying sparse branch events to global steps.
+            if not pruned_this_iter:
+                if stochastic_tri_level:
+                    if getattr(opt, "object_only_until_iter", 0) > 0:
+                        scene_schedule_iter = (
+                            getattr(opt, "object_only_until_iter", 0)
+                            - 1
+                            + scene_isolated_exposures
+                        )
+                    else:
+                        scene_schedule_iter = scene_isolated_exposures
+                else:
+                    scene_schedule_iter = iteration
+
+                if render_background and scene_schedule_iter < opt.densify_until_iter:
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                # Obj: use object-only render stats for densification
+                    if (
+                        scene_schedule_iter > opt.densify_from_iter
+                        and scene_schedule_iter % opt.densification_interval == 0
+                    ):
+                        size_threshold = 20 if scene_schedule_iter > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            0.005,
+                            scene.cameras_extent,
+                            size_threshold,
+                            radii,
+                        )
+
+                    if (
+                        scene_schedule_iter % opt.opacity_reset_interval == 0
+                        or (
+                            dataset.white_background
+                            and scene_schedule_iter == opt.densify_from_iter
+                        )
+                    ) and scene_optim_initialized:
+                        gaussians.reset_opacity()
+
                 for idx in active_obj_indices:
                     obj_vpt = obj_viewspace_point_tensors[idx]
                     obj_vis = obj_visibility_filters[idx]
                     obj_r = obj_radii_list[idx]
                     obj_g = obj_gaussians_list[idx]
                     if obj_vpt is None or obj_vis is None or obj_r is None or obj_vpt.grad is None:
+                        continue
+
+                    obj_schedule_iter = (
+                        object_isolated_exposures[idx]
+                        if stochastic_tri_level
+                        else iteration
+                    )
+                    if obj_schedule_iter >= opt.densify_until_iter:
                         continue
 
                     obj_g.max_radii2D[obj_vis] = torch.max(
@@ -613,44 +820,65 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
                         obj_vpt, obj_vis
                     )
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    if not object_only_phase:
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    for idx in active_obj_indices:
-                        obj_r = obj_radii_list[idx]
-                        obj_g = obj_gaussians_list[idx]
-                        if obj_r is not None:
-                            obj_g.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, obj_r)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    if (not object_only_phase) and scene_optim_initialized:
-                        gaussians.reset_opacity()
-                    for obj_g in obj_gaussians_list:
+                    if (
+                        obj_schedule_iter > opt.densify_from_iter
+                        and obj_schedule_iter % opt.densification_interval == 0
+                    ):
+                        size_threshold = 20 if obj_schedule_iter > opt.opacity_reset_interval else None
+                        obj_g.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            0.005,
+                            scene.cameras_extent,
+                            size_threshold,
+                            obj_r,
+                        )
+
+                    if (
+                        obj_schedule_iter % opt.opacity_reset_interval == 0
+                        or (
+                            dataset.white_background
+                            and obj_schedule_iter == opt.densify_from_iter
+                        )
+                    ):
                         obj_g.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
-                if not object_only_phase:
+                update_scene = render_background or render_composed
+                update_objects = render_objects or render_composed
+
+                if update_scene:
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                     if use_sparse_adam:
-                        visible = radii > 0
-                        gaussians.optimizer.step(visible, radii.shape[0])
+                        if render_background:
+                            scene_optimizer_radii = radii
+                        else:
+                            scene_point_count = gaussians.get_xyz.shape[0]
+                            scene_optimizer_radii = ft_global_pkg["radii"][:scene_point_count]
+                        visible = scene_optimizer_radii > 0
+                        gaussians.optimizer.step(visible, scene_optimizer_radii.shape[0])
                         gaussians.optimizer.zero_grad(set_to_none = True)
                         scene_optim_initialized = True
                     else:
                         gaussians.optimizer.step()
                         gaussians.optimizer.zero_grad(set_to_none = True)
                         scene_optim_initialized = True
-                # Always step object branches
-                for obj_g in obj_gaussians_list:
-                    obj_g.optimizer.step()
-                    obj_g.optimizer.zero_grad(set_to_none = True)
+
+                if update_objects:
+                    for obj_g in obj_gaussians_list:
+                        obj_g.optimizer.step()
+                        obj_g.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    if stochastic_tri_level:
+        print(
+            "\nStochastic tri-level joint-phase counts: "
+            + ", ".join(f"{mode}={count}" for mode, count in tri_level_counts.items())
+        )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
