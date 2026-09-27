@@ -33,7 +33,7 @@ from arguments import ModelParams, OptimizationParams  # noqa: E402
 from scene.gaussian_model import GaussianModel  # noqa: E402
 from scene.dataset_readers import sceneLoadTypeCallbacks, storePly, CameraInfo  # noqa: E402
 from utils.camera_utils import cameraList_from_camInfos  # noqa: E402
-from train import prune_gaussians_with_object_masks  # noqa: E402
+from utils.mask_utils import prune_gaussians_with_object_masks  # noqa: E402
 from utils.sh_utils import SH2RGB  # noqa: E402
 from utils.graphics_utils import BasicPointCloud  # noqa: E402
 from plyfile import PlyData  # noqa: E402

@@ -39,6 +39,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    is_finetune: bool = False
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -146,7 +147,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
                               mask_paths=mask_paths,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              is_finetune=is_finetune)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -273,7 +275,7 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
     
     for c in cam_infos:
         if train_test_exp or not c.is_test:
-            if "images_ft" in c.image_path:
+            if c.is_finetune:
                 finetune_cam_infos.append(c)
             else:
                 train_cam_infos.append(c)

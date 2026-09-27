@@ -23,7 +23,7 @@ class Scene:
     gaussians : GaussianModel
     obj_gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, obj_gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, obj_gaussians=None, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -31,6 +31,7 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
         self.obj_gaussians = obj_gaussians
+        self.object_gaussians = [obj_gaussians] if obj_gaussians is not None else []
         self.obj_ply_path = args.obj_ply_path
 
         if load_iteration:
@@ -44,7 +45,7 @@ class Scene:
         self.test_cameras = {}
         self.finetune_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if any(os.path.exists(os.path.join(args.source_path, name)) for name in ("sparse", "aligned_sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.ft_masks, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -53,6 +54,7 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         self.num_objects = getattr(scene_info, "num_objects", 0)
+        self.initial_ply_path = scene_info.ply_path
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
@@ -88,19 +90,30 @@ class Scene:
                 self.finetune_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.finetune_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
-            self.obj_gaussians.load_obj_ply(self.obj_ply_path)
+            folder = os.path.join(self.model_path, "point_cloud", f"iteration_{self.loaded_iter}")
+            self.gaussians.load_ply(os.path.join(folder, "point_cloud.ply"), args.train_test_exp)
+            metadata_path = os.path.join(folder, "model_meta.json")
+            if os.path.isfile(metadata_path):
+                with open(metadata_path) as file:
+                    metadata = json.load(file)
+                self.gaussians.active_sh_degree = metadata["active_sh_degree"]
+                self.num_objects = metadata["num_objects"]
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
-            self.obj_gaussians.load_obj_ply(self.obj_ply_path)
+            exposure_cameras = scene_info.train_cameras + scene_info.finetune_cameras
+            self.gaussians.create_from_pcd(scene_info.point_cloud, exposure_cameras, self.cameras_extent)
+        if self.obj_gaussians is not None:
+            self.obj_gaussians.load_obj_ply(self.obj_ply_path or self.initial_ply_path)
+
+    def setObjectGaussians(self, models):
+        self.object_gaussians = list(models)
+        self.obj_gaussians = models[0] if models else None
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        self.obj_gaussians.save_ply(os.path.join(point_cloud_path, "obj.ply"))
+        for index, model in enumerate(self.object_gaussians):
+            suffix = "obj.ply" if index == 0 else f"obj_{index}.ply"
+            model.save_ply(os.path.join(point_cloud_path, suffix))
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping
@@ -108,12 +121,26 @@ class Scene:
 
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
             json.dump(exposure_dict, f, indent=2)
+        with open(os.path.join(point_cloud_path, "exposure.json"), "w") as file:
+            json.dump(exposure_dict, file, indent=2)
+        with open(os.path.join(point_cloud_path, "model_meta.json"), "w") as file:
+            json.dump({"schema_version": 1, "iteration": iteration,
+                       "num_objects": len(self.object_gaussians),
+                       "active_sh_degree": self.gaussians.active_sh_degree,
+                       "object_active_sh_degrees": [g.active_sh_degree for g in self.object_gaussians]},
+                      file, indent=2)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getBackgroundTestCameras(self, scale=1.0):
+        return [cam for cam in self.getTestCameras(scale) if not getattr(cam, "is_finetune", False)]
+
+    def getComposedTestCameras(self, scale=1.0):
+        return [cam for cam in self.getTestCameras(scale) if getattr(cam, "is_finetune", False)]
 
     def getFinetuneCameras(self, scale=1.0):
         if self.finetune_cameras:

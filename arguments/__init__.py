@@ -10,6 +10,8 @@
 #
 
 from argparse import ArgumentParser, Namespace
+import ast
+import json
 import sys
 import os
 
@@ -57,13 +59,14 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
+        self.camera_workers = 4
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
-        g.obj_ply_path = os.path.abspath(g.obj_ply_path)
+        g.obj_ply_path = os.path.abspath(g.obj_ply_path) if g.obj_ply_path else ""
         return g
 
 class PipelineParams(ParamGroup):
@@ -101,6 +104,7 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.log_interval = 10
         # Proportion (0.0-1.0) of available mask views required to keep a Gaussian
         self.mask_prune_min_prop = 0.5
         self.mask_prune_threshold = 0.5
@@ -109,23 +113,22 @@ class OptimizationParams(ParamGroup):
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
-    cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
-    args_cmdline = parser.parse_args(cmdlne_string)
-
-    try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
-        with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
-            cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
-    args_cfgfile = eval(cfgfile_string)
-
-    merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
-            merged_dict[k] = v
-    return Namespace(**merged_dict)
+    args = parser.parse_args(sys.argv[1:])
+    root = args.model_path or ""
+    config_path = os.path.join(root, "training_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as file:
+            config = json.load(file)
+        defaults = dict(config["model"], **config["pipeline"])
+    else:
+        config_path = os.path.join(root, "cfg_args")
+        with open(config_path) as file:
+            expression = ast.parse(file.read().strip(), mode="eval").body
+        if not (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+                and expression.func.id == "Namespace" and not expression.args):
+            raise ValueError("Invalid cfg_args: expected Namespace keyword literals")
+        defaults = {arg.arg: ast.literal_eval(arg.value) for arg in expression.keywords}
+    print("Config file found:", config_path)
+    known = {action.dest for action in parser._actions}
+    parser.set_defaults(**{key: value for key, value in defaults.items() if key in known})
+    return parser.parse_args(sys.argv[1:])

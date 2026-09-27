@@ -82,7 +82,7 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args, object_mode=None):
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -95,10 +95,36 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
+        if object_mode == "finetune":
+            self.finetuning_setup(training_args)
+        elif object_mode == "object":
+            self.obj_training_setup(training_args)
+        else:
+            self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+
+    def capture_full(self, include_exposure=True):
+        state = {"gaussians": self.capture()}
+        if include_exposure and hasattr(self, "exposure_optimizer"):
+            state["exposure"] = {
+                "parameters": self._exposure.detach(),
+                "mapping": self.exposure_mapping,
+                "pretrained": self.pretrained_exposures,
+                "optimizer": self.exposure_optimizer.state_dict(),
+            }
+        return state
+
+    def restore_full(self, state, training_args, object_mode=None):
+        exposure = state.get("exposure")
+        if exposure is not None:
+            self._exposure = nn.Parameter(exposure["parameters"].requires_grad_(True))
+            self.exposure_mapping = exposure["mapping"]
+            self.pretrained_exposures = exposure["pretrained"]
+        self.restore(state["gaussians"], training_args, object_mode)
+        if exposure is not None:
+            self.exposure_optimizer.load_state_dict(exposure["optimizer"])
 
     @property
     def get_scaling(self):
@@ -302,7 +328,9 @@ class GaussianModel:
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
         if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
+            exposure_file = os.path.join(os.path.dirname(path), "exposure.json")
+            if not os.path.isfile(exposure_file):
+                exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
             if os.path.exists(exposure_file):
                 with open(exposure_file, "r") as f:
                     exposures = json.load(f)
@@ -462,6 +490,11 @@ class GaussianModel:
             self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
             self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
             self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.spatial_lr_scale = 1.0
+            self.max_radii2D = self._xyz.new_zeros((xyz.shape[0],))
+            self.xyz_gradient_accum = self._xyz.new_zeros((xyz.shape[0], 1))
+            self.denom = self._xyz.new_zeros((xyz.shape[0], 1))
+            self.tmp_radii = None
             return
 
         # Treat this as a plain point cloud (e.g., from COLMAP): delegate to create_from_pcd
@@ -654,6 +687,12 @@ class GaussianModel:
         # Device alignment to avoid CPU/CUDA mask mismatch
         if self.xyz_gradient_accum.device != update_filter.device:
             update_filter = update_filter.to(self.xyz_gradient_accum.device)
+        if update_filter.dtype == torch.bool:
+            # Dense masked updates avoid boolean indexing's CUDA nonzero sync.
+            gradients = torch.norm(viewspace_point_tensor.grad[:, :2], dim=-1, keepdim=True)
+            self.xyz_gradient_accum += torch.where(update_filter[:, None], gradients, 0.)
+            self.denom += update_filter[:, None]
+            return
         self.xyz_gradient_accum[update_filter] += torch.norm(
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )

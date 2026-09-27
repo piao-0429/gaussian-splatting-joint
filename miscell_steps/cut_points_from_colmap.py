@@ -17,7 +17,7 @@ from arguments import ModelParams, OptimizationParams
 from scene.gaussian_model import GaussianModel
 from scene.dataset_readers import sceneLoadTypeCallbacks, storePly
 from utils.camera_utils import cameraList_from_camInfos
-from train import prune_gaussians_with_object_masks
+from utils.mask_utils import prune_gaussians_with_object_masks
 from utils.sh_utils import SH2RGB
 
 

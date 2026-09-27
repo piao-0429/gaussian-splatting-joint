@@ -9,28 +9,27 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
 import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
+from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
+    with ExitStack() as files:
+        image = files.enter_context(Image.open(cam_info.image_path))
+        mask_images = [files.enter_context(Image.open(path)) if path else None
+                       for path in (getattr(cam_info, "mask_paths", None) or [])]
+        return _load_camera(args, id, cam_info, resolution_scale, is_nerf_synthetic,
+                            is_test_dataset, image, mask_images)
 
-    mask_images = []
-    if getattr(cam_info, "mask_paths", None):
-        for mp in cam_info.mask_paths:
-            if mp:
-                try:
-                    mask_images.append(Image.open(mp))
-                except Exception as e:
-                    print(f"[ WARN ] Failed to open mask at {mp}: {e}")
-                    mask_images.append(None)
-            else:
-                mask_images.append(None)
+
+def _load_camera(args, id, cam_info, resolution_scale, is_nerf_synthetic,
+                 is_test_dataset, image, mask_images):
+    from scene.cameras import Camera
 
     if cam_info.depth_path != "":
         try:
@@ -72,25 +71,35 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+    camera = Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
                   image=image, mask_images=mask_images, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+    camera.is_finetune = getattr(cam_info, "is_finetune", False)
+    return camera
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
-    camera_list = []
-
-    for id, c in enumerate(cam_infos):
+    def load(item):
+        id, c = item
         try:
-            camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
+            return loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset)
         except Exception as e:
-            # print(f"Error loading camera {id}: {e}")
-            continue
+            raise RuntimeError(f"Failed to load camera {c.image_name!r} "
+                               f"from {c.image_path}: {e}") from e
+    workers = getattr(args, "camera_workers", None)
+    workers = 4 if workers is None else max(1, workers)
+    if workers == 1 or len(cam_infos) < 2:
+        return [load(item) for item in enumerate(cam_infos)]
+    # Initialize CUDA's lazy linear-algebra wrappers before worker threads enter
+    # Camera.inverse(); older supported PyTorch builds cannot initialize them concurrently.
+    first = load((0, cam_infos[0]))
+    # map yields input order even when decoding finishes out of order, keeping
+    # camera sampling and checkpoint pool order unchanged.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return [first] + list(pool.map(load, enumerate(cam_infos[1:], start=1)))
 
-    return camera_list
-
-def camera_to_JSON(id, camera : Camera):
+def camera_to_JSON(id, camera: "Camera"):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T

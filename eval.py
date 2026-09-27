@@ -1,8 +1,6 @@
 import os
-import random
 import torch
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from tqdm import tqdm
@@ -26,179 +24,90 @@ except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def merge_gaussians(gaussians):
-    if not gaussians:
-        raise ValueError("merge_gaussians expects a non-empty list")
-    if len(gaussians) == 1:
-        return gaussians[0]
-
-    merged_xyz = []
-    merged_features_dc = []
-    merged_features_rest = []
-    merged_scaling = []
-    merged_rotation = []
-    merged_opacity = []
-
-    for g in gaussians:
-        merged_xyz.append(g._xyz)
-        merged_features_dc.append(g._features_dc)
-        merged_features_rest.append(g._features_rest)
-        merged_scaling.append(g._scaling)
-        merged_rotation.append(g._rotation)
-        merged_opacity.append(g._opacity)
-
-    merged_gaussians = GaussianModel(gaussians[0].max_sh_degree)
-    merged_gaussians._xyz = torch.cat(merged_xyz, dim=0)
-    merged_gaussians._features_dc = torch.cat(merged_features_dc, dim=0)
-    merged_gaussians._features_rest = torch.cat(merged_features_rest, dim=0)
-    merged_gaussians._scaling = torch.cat(merged_scaling, dim=0)
-    merged_gaussians._rotation = torch.cat(merged_rotation, dim=0)
-    merged_gaussians._opacity = torch.cat(merged_opacity, dim=0)
-    merged_gaussians.active_sh_degree = gaussians[0].active_sh_degree
-
-    return merged_gaussians
+from utils.joint_utils import merge_gaussians, load_object_gaussians, render_view, share_exposure
+from utils.mask_utils import cam_has_mask, object_mask
 
 
-def cam_has_mask(camera, obj_idx):
-    masks = getattr(camera, "object_masks", []) or []
-    return obj_idx < len(masks) and masks[obj_idx] is not None
-
-
-def load_object_gaussians(dataset, loaded_iter, num_objects, active_sh_degree):
-    iteration_dir = os.path.join(dataset.model_path, "point_cloud", f"iteration_{loaded_iter}")
-    obj_gaussians = []
-
-    for obj_idx in range(num_objects):
-        g = GaussianModel(dataset.sh_degree)
-        suffix = "obj.ply" if obj_idx == 0 else f"obj_{obj_idx}.ply"
-        ply_path = os.path.join(iteration_dir, suffix)
-        fallback_path = dataset.obj_ply_path
-
-        if os.path.exists(ply_path):
-            g.load_obj_ply(ply_path)
-        elif os.path.exists(fallback_path):
-            print(f"[WARN] Missing {ply_path}, falling back to {fallback_path}")
-            g.load_obj_ply(fallback_path)
-        else:
-            print(f"[WARN] No object ply found for obj {obj_idx}; creating empty gaussian set")
-            g._xyz = torch.empty((0, 3), device="cuda")
-            g._features_dc = torch.empty((0, 1, 1), device="cuda")
-            g._features_rest = torch.empty((0, 3, (g.max_sh_degree + 1) ** 2 - 1), device="cuda")
-            g._scaling = torch.empty((0, 3), device="cuda")
-            g._rotation = torch.empty((0, 4), device="cuda")
-            g._opacity = torch.empty((0, 1), device="cuda")
-
-        g.active_sh_degree = active_sh_degree
-        obj_gaussians.append(g)
-
-    return obj_gaussians
-
-
-def render_view(camera, gaussians, pipe, background, train_test_exp, separate_sh, mask_index=None):
-    if camera is None:
-        return None
-
-    render_pkg = render(camera, gaussians, pipe, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)
-    pred = render_pkg["render"]
-    gt = camera.original_image.to(pred.device)
-
-    alpha_mask = getattr(camera, "alpha_mask", None)
-    if alpha_mask is not None:
-        alpha_mask = alpha_mask.to(pred.device)
-        pred = pred * alpha_mask
-        gt = gt * alpha_mask
-
-    if mask_index is not None:
-        masks = getattr(camera, "object_masks", []) or []
-        if mask_index >= len(masks) or masks[mask_index] is None:
-            return None
-        obj_mask = masks[mask_index].to(pred.device)
-        pred = pred * obj_mask
-        gt = gt * obj_mask
-
-    if train_test_exp:
-        pred = pred[..., pred.shape[-1] // 2:]
-        gt = gt[..., gt.shape[-1] // 2:]
-
-    pred = torch.clamp(pred, 0.0, 1.0)
-    gt = torch.clamp(gt, 0.0, 1.0)
-    return pred, gt
-
-
-def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, separate_sh, mask_index=None, gt_mask_index=None, output_root=None, sample_prob=0.02):
-    if not cameras:
-        print(f"[INFO] Split '{name}' has no cameras; skipping.")
-        return {"name": name, "count": 0}
-
-    l1_sum = 0.0
-    psnr_sum = 0.0
-    ssim_sum = 0.0
-    count = 0
-
-    split_out_dir = None
-    if output_root is not None:
-        split_out_dir = os.path.join(output_root, name)
-        os.makedirs(split_out_dir, exist_ok=True)
-
-    for cam in tqdm(cameras, desc=f"Eval {name}", leave=False):
-        rendered = render_view(cam, gaussians, pipe, background, train_test_exp, separate_sh, mask_index)
-        if rendered is None:
+@torch.no_grad()
+def _evaluate_modes(cameras, gaussians, pipe, background, train_test_exp, separate_sh,
+                    modes, output_root=None, sample_count=6):
+    """Score multiple mask modes from one render per camera."""
+    records = [[] for _ in modes]
+    names = [[] for _ in modes]
+    samples = set()
+    if sample_count > 0 and cameras:
+        count = min(sample_count, len(cameras))
+        samples = {round(i * (len(cameras) - 1) / max(1, count - 1)) for i in range(count)}
+    for view_index, cam in enumerate(tqdm(cameras, desc="Eval " + modes[0]["name"], leave=False)):
+        rendered = render_view(cam, gaussians, pipe, background, train_test_exp, separate_sh)
+        if rendered is None or rendered[1] is None:
             continue
-        pred, gt = rendered
-        # If caller requested GT masking only, apply mask to GT (keep pred unmasked)
-        if gt_mask_index is not None:
-            masks = getattr(cam, "object_masks", []) or []
-            if gt_mask_index >= len(masks) or masks[gt_mask_index] is None:
-                # no mask available, skip this view
-                continue
-            gt_mask = masks[gt_mask_index].to(gt.device)
-            gt = gt * gt_mask
-        l1_val = l1_loss(pred, gt).mean().double()
-        psnr_val = psnr(pred, gt).mean().double()
-        if FUSED_SSIM_AVAILABLE:
-            ssim_val = fused_ssim(pred.unsqueeze(0), gt.unsqueeze(0))
+        raw_pred, raw_gt = rendered
+        for index, mode in enumerate(modes):
+            pred, gt = raw_pred, raw_gt
+            mask_index = mode.get("mask_index")
+            if mask_index is not None:
+                mask = object_mask(cam, mask_index)
+                if mask is None:
+                    continue
+                mask = mask.to(pred.device)
+                if train_test_exp:
+                    mask = mask[..., mask.shape[-1] // 2:]
+                gt = gt * mask
+                if mode.get("mask_prediction", True):
+                    pred = pred * mask
+            ssim_value = (fused_ssim(pred.unsqueeze(0), gt.unsqueeze(0))
+                          if FUSED_SSIM_AVAILABLE else ssim(pred, gt))
+            records[index].append(torch.stack((l1_loss(pred, gt).mean(), psnr(pred, gt).mean(),
+                                               ssim_value.clamp(0, 1))).double())
+            names[index].append(cam.image_name)
+            if output_root and view_index in samples:
+                folder = os.path.join(output_root, mode["name"])
+                os.makedirs(folder, exist_ok=True)
+                filename = cam.image_name.replace("/", "_").replace("\\", "_") + ".png"
+                torchvision.utils.save_image(torch.cat((gt, pred, (gt-pred).abs()), dim=2),
+                                             os.path.join(folder, filename))
+    results = []
+    for mode, values, image_names in zip(modes, records, names):
+        result = {"name": mode["name"], "count": len(values)}
+        if values:
+            # One device-to-host transfer per split, instead of three per view.
+            scores = torch.stack(values).cpu()
+            result.update(dict(zip(("l1", "psnr", "ssim"), scores.mean(dim=0).tolist())))
+            print(f"[RESULT] {mode['name']}: views={len(values)} L1={result['l1']:.4f} "
+                  f"PSNR={result['psnr']:.2f} SSIM={result['ssim']:.4f}")
+            if output_root:
+                folder = os.path.join(output_root, mode["name"])
+                os.makedirs(folder, exist_ok=True)
+                rows = [dict(image_name=name, l1=row[0], psnr=row[1], ssim=row[2])
+                        for name, row in zip(image_names, scores.tolist())]
+                with open(os.path.join(folder, "per_view_metrics.json"), "w") as file:
+                    json.dump(rows, file, indent=2)
         else:
-            ssim_val = ssim(pred, gt)
-        ssim_val = torch.clamp(ssim_val, 0.0, 1.0)
-
-        l1_sum += l1_val.item()
-        psnr_sum += psnr_val.item()
-        ssim_sum += ssim_val.item()
-        count += 1
-
-        # With small probability, dump GT | Pred | AbsDiff for inspection
-        if split_out_dir and random.random() < sample_prob:
-            diff = torch.abs(pred - gt)
-            composite = torch.cat([gt, pred, diff], dim=2)
-            safe_name = cam.image_name.replace("/", "_").replace("\\", "_")
-            fname = f"{safe_name}.png"
-            out_path = os.path.join(split_out_dir, fname)
-            torchvision.utils.save_image(composite, out_path)
-
-    if count == 0:
-        print(f"[INFO] Split '{name}' had no usable masked views; skipping metrics.")
-        return {"name": name, "count": 0}
-
-    result = {
-        "name": name,
-        "count": count,
-        "l1": l1_sum / count,
-        "psnr": psnr_sum / count,
-        "ssim": ssim_sum / count,
-    }
-    print(f"[RESULT] {name}: views={count} L1={result['l1']:.4f} PSNR={result['psnr']:.2f} SSIM={result['ssim']:.4f}")
-    return result
+            print(f"[INFO] Split '{mode['name']}' has no usable views; skipping.")
+        results.append(result)
+    return results
 
 
-def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_finetune=False, skip_objects=False):
+def evaluate_split(name, cameras, gaussians, pipe, background, train_test_exp, separate_sh,
+                   mask_index=None, gt_mask_index=None, output_root=None, sample_count=6):
+    modes = [{"name": name, "mask_index": mask_index if mask_index is not None else gt_mask_index,
+              "mask_prediction": mask_index is not None}]
+    return _evaluate_modes(cameras, gaussians, pipe, background, train_test_exp, separate_sh,
+                           modes, output_root, sample_count)[0]
+
+
+def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_finetune=False, skip_objects=False, sample_count=6):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        placeholder_obj = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, placeholder_obj, load_iteration=iteration, shuffle=False)
+        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         loaded_iter = scene.loaded_iter if scene.loaded_iter is not None else iteration
-        num_objects = max(1, getattr(scene, "num_objects", 1))
+        num_objects = scene.num_objects
         obj_gaussians = load_object_gaussians(dataset, loaded_iter, num_objects, scene.gaussians.active_sh_degree)
+        for model in obj_gaussians:
+            share_exposure(model, scene.gaussians)
+        merged_all = merge_gaussians([scene.gaussians] + obj_gaussians)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -216,7 +125,7 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
-                    output_root=output_root,
+                    output_root=output_root, sample_count=sample_count,
                 )
             )
 
@@ -224,19 +133,26 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
             results.append(
                 evaluate_split(
                     "test_scene",
-                    scene.getTestCameras(),
+                    scene.getBackgroundTestCameras(),
                     scene.gaussians,
                     pipe,
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
-                    output_root=output_root,
+                    output_root=output_root, sample_count=sample_count,
+                )
+            )
+
+            results.append(
+                evaluate_split(
+                    "test_scene_plus_objects", scene.getComposedTestCameras(), merged_all,
+                    pipe, background, dataset.train_test_exp, SPARSE_ADAM_AVAILABLE,
+                    output_root=output_root, sample_count=sample_count,
                 )
             )
 
         ft_cameras = scene.getFinetuneCameras()
         if (not skip_finetune) and ft_cameras:
-            merged_all = merge_gaussians([scene.gaussians] + obj_gaussians)
             results.append(
                 evaluate_split(
                     "finetune_scene_plus_objects",
@@ -246,40 +162,20 @@ def evaluate(dataset, pipe, iteration, skip_train=False, skip_test=False, skip_f
                     background,
                     dataset.train_test_exp,
                     SPARSE_ADAM_AVAILABLE,
-                    output_root=output_root,
+                    output_root=output_root, sample_count=sample_count,
                 )
             )
 
             if not skip_objects:
                 for obj_idx in range(num_objects):
                     cams_for_obj = [c for c in ft_cameras if cam_has_mask(c, obj_idx)]
-                    results.append(
-                        evaluate_split(
-                            f"finetune_obj{obj_idx}_masked",
-                            cams_for_obj,
-                            obj_gaussians[obj_idx],
-                            pipe,
-                            background,
-                            dataset.train_test_exp,
-                            SPARSE_ADAM_AVAILABLE,
-                            mask_index=obj_idx,
-                            output_root=output_root,
-                        )
-                    )
-                    results.append(
-                        evaluate_split(
-                            f"finetune_obj{obj_idx}_unmasked",
-                            cams_for_obj,
-                            obj_gaussians[obj_idx],
-                            pipe,
-                            background,
-                            dataset.train_test_exp,
-                            SPARSE_ADAM_AVAILABLE,
-                            mask_index=None,
-                            gt_mask_index=obj_idx,
-                            output_root=output_root,
-                        )
-                    )
+                    modes = [
+                        {"name": f"finetune_obj{obj_idx}_masked", "mask_index": obj_idx, "mask_prediction": True},
+                        {"name": f"finetune_obj{obj_idx}_unmasked", "mask_index": obj_idx, "mask_prediction": False},
+                    ]
+                    results.extend(_evaluate_modes(cams_for_obj, obj_gaussians[obj_idx], pipe, background,
+                                                   dataset.train_test_exp, SPARSE_ADAM_AVAILABLE,
+                                                   modes, output_root, sample_count))
 
         return results
 
@@ -294,8 +190,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip_finetune", action="store_true")
     parser.add_argument("--skip_objects", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--sample_count", type=int, default=6)
 
     args = get_combined_args(parser)
+    if args.iteration == -1:
+        from utils.system_utils import searchForMaxIteration
+        args.iteration = searchForMaxIteration(os.path.join(args.model_path, "point_cloud"))
     print("Evaluating " + args.model_path)
 
     safe_state(args.quiet)
@@ -308,6 +208,7 @@ if __name__ == "__main__":
         skip_test=args.skip_test,
         skip_finetune=args.skip_finetune,
         skip_objects=args.skip_objects,
+        sample_count=args.sample_count,
     )
 
     # Persist results to JSON under model_path/eval
