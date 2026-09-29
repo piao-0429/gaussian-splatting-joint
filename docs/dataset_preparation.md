@@ -42,7 +42,9 @@ Omit `--no_gpu` with a CUDA-enabled COLMAP build. The script outputs `images/` a
 
 ## 2. Organize the reconstruction and view groups
 
-The trainer reads a binary reconstruction from `aligned_sparse/0/`. If no additional geometric alignment is needed, copy the three files from the same reconstruction into a new directory:
+DexMirror training, rendering, evaluation, and mask extraction require `aligned_sparse/0/cameras.bin`, `images.bin`, and `points3D.bin` from the same reconstruction. The loader reports missing or unreadable files directly; it does not switch to `sparse/0` or Blender datasets. COLMAP still writes `sparse/0` as an intermediate output.
+
+If no additional geometric alignment is needed, copy the three files into a new directory:
 
 ```bash
 mkdir -p "$DATASET/aligned_sparse/0"

@@ -75,7 +75,7 @@ class JointGPUTests(unittest.TestCase):
                       '--densify_until_iter', 8, '--densification_interval', 2,
                       '--opacity_reset_interval', 1000, '--prune_iterations', 6, 12,
                       '--checkpoint_iterations', 2, 6, 12, '--test_iterations', 12,
-                      '--save_iterations', 12, '--random_background', '--disable_viewer',
+                      '--save_iterations', 12, '--random_background',
                       # Spherical initialization has near-zero rotation gradients;
                       # Adam amplifies atomic roundoff into different split points.
                       # Freeze rotations for the trajectory comparison only.
@@ -236,7 +236,7 @@ class JointGPUTests(unittest.TestCase):
                 patch.object(train, 'SummaryWriter', return_value=writer, create=True), \
                 patch.object(GaussianModel, 'save_ply', save):
             train.training(lp.extract(args), op.extract(args), pp.extract(args),
-                           [2, 5], [5], [5], [], None, -1, disable_viewer=True)
+                           [2, 5], [5], [5], [], None, -1)
         scalar_steps = [(call.args[0], call.args[2]) for call in writer.add_scalar.call_args_list]
         self.assertEqual([step for name, step in scalar_steps if name == 'iter_time'], [3, 5])
         self.assertIn(('test_scene_plus_objects/loss_viewpoint - l1_loss', 2), scalar_steps)

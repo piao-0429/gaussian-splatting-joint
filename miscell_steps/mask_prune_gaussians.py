@@ -31,7 +31,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from arguments import ModelParams, OptimizationParams  # noqa: E402
 from scene.gaussian_model import GaussianModel  # noqa: E402
-from scene.dataset_readers import sceneLoadTypeCallbacks, storePly  # noqa: E402
+from scene.dataset_readers import readColmapSceneInfo, storePly  # noqa: E402
 from utils.camera_utils import cameraList_from_camInfos  # noqa: E402
 from utils.sh_utils import SH2RGB  # noqa: E402
 from utils.mask_utils import compute_prune_mask
@@ -163,11 +163,11 @@ def build_cameras(scene_info, dataset):
 
     cameras = []
     if scene_info.train_cameras:
-        cameras += cameraList_from_camInfos(scene_info.train_cameras, 1.0, dataset, scene_info.is_nerf_synthetic, False)
+        cameras += cameraList_from_camInfos(scene_info.train_cameras, 1.0, dataset, False)
     if scene_info.test_cameras:
-        cameras += cameraList_from_camInfos(scene_info.test_cameras, 1.0, dataset, scene_info.is_nerf_synthetic, True)
+        cameras += cameraList_from_camInfos(scene_info.test_cameras, 1.0, dataset, True)
     if scene_info.finetune_cameras:
-        cameras += cameraList_from_camInfos(scene_info.finetune_cameras, 1.0, dataset, scene_info.is_nerf_synthetic, False)
+        cameras += cameraList_from_camInfos(scene_info.finetune_cameras, 1.0, dataset, False)
 
     return cam_infos, cameras
 
@@ -421,7 +421,7 @@ def main():
     args, dataset, opt = parse_args()
     torch.set_grad_enabled(False)
 
-    scene_info = sceneLoadTypeCallbacks["Colmap"](
+    scene_info = readColmapSceneInfo(
         dataset.source_path,
         dataset.images,
         dataset.depths,
@@ -432,7 +432,7 @@ def main():
 
     cam_infos, cameras = build_cameras(scene_info, dataset)
     if not cameras:
-        print("No cameras found; check sparse/0 and images/ under source_path.")
+        print("No cameras found; check aligned_sparse/0, images/ and images_ft/ under source_path.")
         return
 
     report_masks(cam_infos, cameras, dataset)

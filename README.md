@@ -184,11 +184,10 @@ python train.py \
   --mask_prune_min_prop 0.6 \
   --mask_prune_expand 2 \
   --save_iterations 7000 10000 30000 100000 \
-  --checkpoint_iterations 7000 10000 30000 60000 90000 100000 \
-  --disable_viewer
+  --checkpoint_iterations 7000 10000 30000 60000 90000 100000
 ```
 
-Check that the background views and object masks load successfully at startup.
+Training runs without a viewer server. Check that the background views and object masks load successfully at startup.
 
 <details>
 <summary>Initialization, GPU memory, pruning, and resuming a run</summary>
@@ -202,7 +201,7 @@ Mask-based pruning occurs at the save iterations above. To control it independen
 Resume an interrupted run from a full joint checkpoint:
 
 ```bash
-python train.py --start_checkpoint "$MODEL_DIR/chkpnt60000.pth" --disable_viewer
+python train.py --start_checkpoint "$MODEL_DIR/chkpnt60000.pth"
 ```
 
 The checkpoint restores the saved run configuration, background and object models, optimizers, samplers, and random state. Explicit command-line arguments override the saved configuration.

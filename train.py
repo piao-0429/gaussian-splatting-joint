@@ -15,14 +15,14 @@ import json
 import time
 import torch
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, SUPPRESS
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -48,7 +48,7 @@ from utils.training_state import (CameraSampler, capture_rng, restore_rng, run_c
                                  save_run_config, save_checkpoint, load_checkpoint, parse_training_args)
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_iterations, checkpoint_iterations, checkpoint, debug_from, disable_viewer=False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -72,7 +72,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
     config = run_config(dataset, opt, pipe, {
         "test_iterations": testing_iterations, "save_iterations": saving_iterations,
         "prune_iterations": pruning_iterations, "checkpoint_iterations": checkpoint_iterations,
-        "start_checkpoint": checkpoint, "debug_from": debug_from, "disable_viewer": disable_viewer,
+        "start_checkpoint": checkpoint, "debug_from": debug_from,
     })
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -144,21 +144,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, pruning_
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if not disable_viewer and network_gui.conn == None:
-            network_gui.try_connect()
-        while not disable_viewer and network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
         log_this_iter = iteration % opt.log_interval == 0 or iteration == opt.iterations
         if iter_start is not None and log_this_iter:
             iter_start.record()
@@ -567,8 +552,6 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 10_000, 30_000])
@@ -585,7 +568,8 @@ if __name__ == "__main__":
         help="Iterations for mask-based object pruning. Include the final training iteration to prune immediately before the final save.",
     )
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument('--disable_viewer', action='store_true', default=False)
+    # Accept historical DexMirror commands; training is now always headless.
+    parser.add_argument('--disable_viewer', action='store_true', help=SUPPRESS)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parse_training_args(parser, sys.argv[1:])
@@ -599,11 +583,9 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
+    # Configure and run training.
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.prune_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.disable_viewer)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.prune_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")

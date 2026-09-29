@@ -18,25 +18,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
+def loadCam(args, id, cam_info, resolution_scale, is_test_dataset):
     with ExitStack() as files:
         image = files.enter_context(Image.open(cam_info.image_path))
         mask_images = [files.enter_context(Image.open(path)) if path else None
                        for path in (getattr(cam_info, "mask_paths", None) or [])]
-        return _load_camera(args, id, cam_info, resolution_scale, is_nerf_synthetic,
+        return _load_camera(args, id, cam_info, resolution_scale,
                             is_test_dataset, image, mask_images)
 
 
-def _load_camera(args, id, cam_info, resolution_scale, is_nerf_synthetic,
+def _load_camera(args, id, cam_info, resolution_scale,
                  is_test_dataset, image, mask_images):
     from scene.cameras import Camera
 
     if cam_info.depth_path != "":
         try:
-            if is_nerf_synthetic:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
-            else:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
+            invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
 
         except FileNotFoundError:
             print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
@@ -79,11 +76,11 @@ def _load_camera(args, id, cam_info, resolution_scale, is_nerf_synthetic,
     camera.is_finetune = getattr(cam_info, "is_finetune", False)
     return camera
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_test_dataset):
     def load(item):
         id, c = item
         try:
-            return loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset)
+            return loadCam(args, id, c, resolution_scale, is_test_dataset)
         except Exception as e:
             raise RuntimeError(f"Failed to load camera {c.image_name!r} "
                                f"from {c.image_path}: {e}") from e

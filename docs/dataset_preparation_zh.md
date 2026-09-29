@@ -128,6 +128,8 @@ cp -n "$DATASET/sparse/0/points3D.bin" "$DATASET/aligned_sparse/0/"
 
 如果输入只有文本模型，先在独立目录通过 `colmap model_converter --input_path ... --output_path ... --output_type BIN` 转成二进制，再整理到上面的目录。虽然读取器有部分文本回退逻辑，本文统一使用二进制格式，避免相机和点云从不同位置读入。
 
+训练、渲染、评估和掩码裁剪统一读取 `aligned_sparse/0` 中的 `cameras.bin`、`images.bin`、`points3D.bin`。缺失或损坏时会直接报错，不再回退读取 `sparse/0` 或 Blender 数据集。`sparse/0` 仍作为 COLMAP 重建的中间输出保留。
+
 训练和点云提取脚本会在缺少 `aligned_sparse/0/points3D.ply` 时，从 `points3D.bin` 生成该文件。VGGT-X 的 `sparse/points.ply` 是另一份预览输出，不应直接改名覆盖它。已有 `points3D.ply` 也必须与当前相机、点云来自同一次重建。
 
 ## 3. 划分背景和物体视角
@@ -405,8 +407,7 @@ python train.py \
   --mask_prune_min_prop 0.6 \
   --mask_prune_expand 2 \
   --save_iterations 7000 10000 30000 \
-  --checkpoint_iterations 7000 10000 30000 \
-  --disable_viewer
+  --checkpoint_iterations 7000 10000 30000
 ```
 
 `--object_only_until_iter 8000` 表示迭代号小于 8000 时只训练物体，从第 8000 步进入联合阶段。初始化 PLY 如果尚未生成，场景加载会先从二进制点云生成它。

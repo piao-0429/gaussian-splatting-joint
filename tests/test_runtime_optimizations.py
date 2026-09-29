@@ -18,7 +18,7 @@ class CameraLoadingTests(unittest.TestCase):
             time.sleep((8-index) * .001)
             return camera
         with patch('utils.camera_utils.loadCam', side_effect=load):
-            result = cameraList_from_camInfos(cameras, 1., SimpleNamespace(camera_workers=4), False, False)
+            result = cameraList_from_camInfos(cameras, 1., SimpleNamespace(camera_workers=4), False)
         self.assertEqual(result, cameras)
 
     def test_camera_failure_is_reported_instead_of_silently_dropped(self):
@@ -26,7 +26,7 @@ class CameraLoadingTests(unittest.TestCase):
         camera = SimpleNamespace(image_name='broken.png', image_path='/data/broken.png')
         with patch('utils.camera_utils.loadCam', side_effect=OSError('corrupt image')):
             with self.assertRaisesRegex(RuntimeError, 'broken.png.*corrupt image'):
-                cameraList_from_camInfos([camera], 1., None, False, False)
+                cameraList_from_camInfos([camera], 1., None, False)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'requires CUDA')

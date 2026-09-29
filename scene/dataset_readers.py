@@ -11,16 +11,13 @@
 
 import os
 import sys
-from PIL import Image
 from typing import NamedTuple
-from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
-    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
-from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from scene.colmap_loader import (qvec2rotmat, read_extrinsics_binary,
+                                 read_intrinsics_binary, read_points3D_binary)
+from utils.graphics_utils import getWorld2View2, focal2fov
 import numpy as np
 import json
-from pathlib import Path
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
 MASK_EXTENSIONS = [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
@@ -48,7 +45,6 @@ class SceneInfo(NamedTuple):
     finetune_cameras: list
     nerf_normalization: dict
     ply_path: str
-    is_nerf_synthetic: bool
     num_objects: int
 
 def getNerfppNorm(cam_info):
@@ -180,18 +176,21 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, llffhold=8):
+    model_dir = os.path.join(path, "aligned_sparse", "0")
+    required = ("cameras.bin", "images.bin", "points3D.bin")
+    missing = [name for name in required if not os.path.isfile(os.path.join(model_dir, name))]
+    if missing:
+        raise FileNotFoundError(
+            f"DexMirror requires an aligned COLMAP reconstruction in {model_dir!r}. "
+            f"Missing: {', '.join(missing)}. Prepare cameras.bin, images.bin and "
+            "points3D.bin from the same reconstruction; see docs/dataset_preparation.md.")
     try:
-        cameras_extrinsic_file = os.path.join(path, "aligned_sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "aligned_sparse/0", "cameras.bin")
-        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+        cam_extrinsics = read_extrinsics_binary(os.path.join(model_dir, "images.bin"))
+        cam_intrinsics = read_intrinsics_binary(os.path.join(model_dir, "cameras.bin"))
+    except Exception as error:
+        raise ValueError(f"Cannot read aligned COLMAP cameras from {model_dir!r}") from error
 
-    depth_params_file = os.path.join(path, "aligned_sparse/0", "depth_params.json")
+    depth_params_file = os.path.join(model_dir, "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -214,15 +213,13 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
             sys.exit(1)
 
     if eval:
-        if "360" in path:
-            llffhold = 8
         if llffhold:
             print("------------LLFF HOLD-------------")
             cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
             cam_names = sorted(cam_names)
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
         else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
+            with open(os.path.join(model_dir, "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
         test_cam_names_list = []
@@ -266,9 +263,6 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
             name = os.path.basename(folder.rstrip(os.sep)) or folder
             print(f"  Object {i}: folder='{folder}' (name='{name}') -> {counts[i]} masks matched")
 
-    # train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
-    # test_cam_infos = [c for c in cam_infos if c.is_test]
-    
     train_cam_infos = []
     finetune_cam_infos = []
     test_cam_infos = []
@@ -281,41 +275,22 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
                 train_cam_infos.append(c)
         if c.is_test:
             test_cam_infos.append(c)
-    # if train_list is not None:
-    #     train_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in train_list]
-    #     test_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in test_list]
-    #     print(f"train_cam_infos {len(train_cam_infos)}, test_cam_infos {len(test_cam_infos)}")
-    # elif eval:
-    #     train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-    #     test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-    # else:
-    #     train_cam_infos = []
-    #     finetune_cam_infos = []
-    #     for c in cam_infos:
-    #         if "images_ft" in c.image_path:
-    #             finetune_cam_infos.append(c)
-    #         else:
-    #             train_cam_infos.append(c)
-    #     test_cam_infos = []
-        
-    
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "aligned_sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "aligned_sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "aligned_sparse/0/points3D.txt")
+    ply_path = os.path.join(model_dir, "points3D.ply")
     if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        bin_path = os.path.join(model_dir, "points3D.bin")
+        print("Converting aligned points3D.bin to points3D.ply.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
+        except Exception as error:
+            raise ValueError(f"Cannot read aligned COLMAP points from {bin_path!r}") from error
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+    except Exception as error:
+        raise ValueError(f"Cannot read aligned point cloud {ply_path!r}") from error
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -323,109 +298,5 @@ def readColmapSceneInfo(path, images, depths, ft_masks, eval, train_test_exp, ll
                            finetune_cameras=finetune_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           is_nerf_synthetic=False,
                            num_objects=len(object_mask_folders))
     return scene_info
-
-def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
-    cam_infos = []
-
-    with open(os.path.join(path, transformsfile)) as json_file:
-        contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
-
-        frames = contents["frames"]
-        for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
-
-            # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
-
-            # get the world-to-camera transform and set R, T
-            w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
-
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
-            image = Image.open(image_path)
-
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
-            FovX = fovx
-
-            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
-
-            cam_infos.append(CameraInfo(
-                uid=idx,
-                R=R,
-                T=T,
-                FovY=FovY,
-                FovX=FovX,
-                depth_params=None,
-                image_path=image_path,
-                image_name=image_name,
-                depth_path=depth_path,
-                mask_paths=[],
-                width=image.size[0],
-                height=image.size[1],
-                is_test=is_test,
-            ))
-            
-    return cam_infos
-
-def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"):
-
-    depths_folder=os.path.join(path, depths) if depths != "" else ""
-    print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", depths_folder, white_background, False, extension)
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", depths_folder, white_background, True, extension)
-    
-    if not eval:
-        train_cam_infos.extend(test_cam_infos)
-        test_cam_infos = []
-
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
-
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           finetune_cameras=[],
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=True,
-                           num_objects=0)
-    return scene_info
-
-sceneLoadTypeCallbacks = {
-    "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
-}
