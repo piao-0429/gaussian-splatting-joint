@@ -313,7 +313,15 @@ def prune_all_masks(args, dataset, opt, scene_info, cam_infos, cameras):
         if n_object > 0:
             union_objects |= object_mask
 
-    # After computing all slots, save final remaining cloud = original - union_removed
+    # The joint trainer accepts one initialization PLY shared by all objects.
+    # Save their union from the original cloud so overlapping masks do not
+    # duplicate points when preparing a multi-object initialization.
+    if union_objects.any():
+        union_colmap, union_gauss = save_gaussian_subset(
+            gaussians_orig, union_objects, args.output_path, "point3D_objects")
+        print(f"Object union saved: {union_colmap}, {union_gauss}")
+
+    # Save the background remainder separately from the object initialization.
     final_dir = os.path.join(args.output_path, "final")
     os.makedirs(final_dir, exist_ok=True)
 

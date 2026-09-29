@@ -1,20 +1,21 @@
-name: gaussian_splatting
+name: dexmirror
 channels:
-  - pytorch
   - conda-forge
-  - defaults
 dependencies:
-  - cudatoolkit=11.6
-  - plyfile
-  - python=3.7.13
-  - pip=22.3.1
-  - pytorch=1.12.1
-  - torchaudio=0.12.1
-  - torchvision=0.13.1
-  - tqdm
+  - python=3.8.20
+  - pip=24.2
   - pip:
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
-    - submodules/fused-ssim
-    - opencv-python
-    - joblib
+    - --extra-index-url https://download.pytorch.org/whl/cu118
+    - torch==2.0.0+cu118
+    - torchvision==0.15.1+cu118
+    - numpy==1.24.1
+    - plyfile==1.0.3
+    - Pillow==10.2.0
+    - opencv-python==4.11.0.86
+    - joblib==1.4.2
+    - tqdm==4.67.1
+    - setuptools==75.1.0
+    - wheel==0.45.1
+    - ninja
+# Install the three local CUDA extensions after creating this environment.
+# A CUDA 11.8 toolkit (including nvcc) is required separately; see README.md.
