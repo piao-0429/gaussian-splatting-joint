@@ -9,9 +9,9 @@
 <p align="center">
   <a href=""><img src="https://img.shields.io/badge/arXiv-B31B1B?style=for-the-badge&amp;logo=arxiv&amp;logoColor=white" alt="arXiv" title="Paper — link coming soon"></a>
   <a href=""><img src="https://img.shields.io/badge/Poster-2563EB?style=for-the-badge&amp;logo=googleslides&amp;logoColor=white" alt="Poster" title="Poster — link coming soon"></a>
-  <a href=""><img src="https://img.shields.io/badge/Hugging%20Face-FFD21E?style=for-the-badge&amp;logo=huggingface&amp;logoColor=black" alt="Hugging Face Dataset" title="Dataset — link coming soon"></a>
+  <a href="https://huggingface.co/datasets/limonkig/dexmirror-scenes"><img src="https://img.shields.io/badge/Hugging%20Face-FFD21E?style=for-the-badge&amp;logo=huggingface&amp;logoColor=black" alt="Hugging Face Dataset" title="Download DexMirror datasets"></a>
 </p>
-<!-- Add the arXiv, poster, and dataset URLs to the empty href attributes above. -->
+<!-- Add the arXiv and poster URLs to the empty href attributes above. -->
 
 This repository provides the scene reconstruction code for **DexMirror: Real-to-Sim Scene Mirroring for Sim-to-Real Dexterous Manipulation**, accepted at **NeurIPS 2026**. DexMirror represents the background and interactable objects as separate 3D Gaussian models, with joint optimization over background, object, and composed views. The resulting assets support photorealistic rendering and independent object placement.
 
@@ -79,7 +79,7 @@ conda env create -f environment.yml
 conda activate dexmirror
 ```
 
-The [environment file](environment.yml) pins the Python/PyTorch packages used by our reconstruction runs. CUDA extensions are installed **after** PyTorch is available. A full CUDA 11.8 toolkit, including `nvcc`, is needed to compile them; the PyTorch wheel does not supply the compiler. This follows the [upstream 3DGS build requirements](https://github.com/graphdeco-inria/gaussian-splatting#software-requirements).
+The [environment file](environment.yml) pins the Python/PyTorch packages used by our reconstruction runs and selects only the `conda-forge` channel, so custom default channels do not affect installation. CUDA extensions are installed **after** PyTorch is available. A full CUDA 11.8 toolkit, including `nvcc`, is needed to compile them; the PyTorch wheel does not supply the compiler. This follows the [upstream 3DGS build requirements](https://github.com/graphdeco-inria/gaussian-splatting#software-requirements).
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-11.8
@@ -90,6 +90,7 @@ python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterizat
 python -m pip install --no-build-isolation ./submodules/simple-knn
 python -m pip install --no-build-isolation ./submodules/fused-ssim
 
+python -m pip check
 python -c "import torch, diff_gaussian_rasterization, simple_knn._C, fused_ssim; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
@@ -105,7 +106,7 @@ Use separate environments for the data preparation models. In particular, curren
 Install the official repository and its dependencies, then download the Large checkpoint. The model setup and command-line options are documented in [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2#usage).
 
 ```bash
-conda create -n depth-anything python=3.10 pip -y
+conda create -n depth-anything python=3.10 pip -y --override-channels -c conda-forge
 conda activate depth-anything
 git clone https://github.com/DepthAnything/Depth-Anything-V2.git "$REPO/../Depth-Anything-V2"
 export DEPTH_ROOT="$REPO/../Depth-Anything-V2"
@@ -127,7 +128,7 @@ curl -fL \
 Install SAM2 with the notebook dependencies and download the SAM 2.1 Large checkpoint. The same CUDA 11.8 toolkit can build its optional extension with the PyTorch wheel below. [Official installation and checkpoints](https://github.com/facebookresearch/sam2#installation).
 
 ```bash
-conda create -n sam2 python=3.10 pip -y
+conda create -n sam2 python=3.10 pip -y --override-channels -c conda-forge
 conda activate sam2
 git clone https://github.com/facebookresearch/sam2.git "$REPO/../sam2"
 export SAM2_ROOT="$REPO/../sam2"
@@ -148,7 +149,9 @@ SAM2 accepts point and box prompts. We provide [a command-line mask exporter](sc
 
 ## Build a dataset
 
-Capture overlapping views of a static scene both **with the target objects present** and **with them removed**. The background and objects must share one camera reconstruction.
+**Use our prepared scenes:** download the Franka Pour Coke and Real2Sim ZIPs from [Hugging Face](https://huggingface.co/datasets/limonkig/dexmirror-scenes/tree/main). Check them against `SHA256SUMS`, then extract the archives to obtain `franka_pour_coke/` and `real2sim/`. Set `DATASET` to the extracted scene folder and continue with [Run DexMirror](#run-dexmirror).
+
+**Build your own dataset:** capture overlapping views of a static scene both **with the target objects present** and **with them removed**. The background and objects must share one camera reconstruction.
 
 | Step | What you prepare |
 | --- | --- |
@@ -158,7 +161,7 @@ Capture overlapping views of a static scene both **with the target objects prese
 | 4. Segment objects | Prompt SAM2, inspect the masks, and restore their original image names. |
 | 5. Extract points | Use the masks to extract object point clouds for initialization. |
 
-Follow the **[dataset preparation guide](docs/dataset_preparation.md)** for the commands, folder layout, and mask examples. A [Chinese guide](docs/dataset_preparation_zh.md) also covers the optional VGGT-X route. If you already have a prepared dataset in this layout, continue with training.
+Follow the **[dataset preparation guide](docs/dataset_preparation.md)** for the COLMAP workflow, folder layout, and mask examples. A [Chinese guide](docs/dataset_preparation_zh.md) provides the same workflow with additional mask checks. If you already have a prepared dataset in this layout, continue with training.
 
 ## Run DexMirror
 

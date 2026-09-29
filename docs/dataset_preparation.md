@@ -6,7 +6,7 @@ This guide follows the COLMAP workflow from captured images to training inputs. 
 
 Use a scene containing the objects you want to interact with. Capture overlapping views around the scene and each object, including low and high viewpoints. Keep the object poses fixed within a reconstruction. Capture background views with the target objects removed, as well as object-containing views, while keeping the background geometry consistent.
 
-The workflow is: **capture → COLMAP → organize views → depth → object masks → object point clouds**. The [Chinese dataset guide](dataset_preparation_zh.md) includes additional mask checks and an alternative VGGT-X reconstruction route.
+The workflow is: **capture → COLMAP → organize views → depth → object masks → object point clouds**. The [Chinese dataset guide](dataset_preparation_zh.md) describes the same workflow and includes additional mask checks.
 
 Set absolute paths in your working terminal:
 

@@ -2,14 +2,13 @@
 
 本文说明如何从场景照片制作 `gaussian-splatting-joint` 所需的数据集，包括相机重建、背景与物体视角划分、SAM2 掩码、深度图、点云检查，以及训练入口。Franka Coke、Real2Sim 和 franka_object 均可使用这套流程。
 
-依据：原始实验记录 `Full Reproduce.docx`，并按当前 `cm_triple_dev` 工作区程序更新（2026-09-29）。外部脚本按本机 VGGT-X、SAM2、Depth-Anything-V2 的实际代码核对。本文中的命令已更新，旧记录里的参数不能直接混用。
+本指南以当前程序为准，使用 COLMAP 重建相机和点云，再通过 Depth Anything V2 和 SAM2 准备深度与物体掩码。流程为：**采集照片 → COLMAP 重建与去畸变 → 划分视角 → 深度与掩码 → 物体点云 → 训练**。
 
 ## 1. 准备程序和路径
 
 | 程序 | 本文使用的入口 | 用途 |
 | --- | --- | --- |
-| VGGT-X | `demo_colmap_new.py` | 估计相机与点云，导出 COLMAP 格式 |
-| COLMAP，可选 | 本仓库的 `convert.py` | 使用传统 SfM 重建并去畸变 |
+| COLMAP | 本仓库的 `convert.py` | 重建相机与点云，并去畸变 |
 | SAM2 | `notebooks/video_predictor_example.ipynb` | 交互标注、传播和导出物体掩码 |
 | 本仓库 | `scripts/sam2_frame_mapping.py` | 建立数字帧、保存映射、恢复掩码原图名 |
 | Depth-Anything-V2 | `run.py` | 预测相对深度图 |
@@ -17,23 +16,22 @@
 | 本仓库 | `miscell_steps/mask_prune_gaussians.py` | 按物体掩码提取点云 |
 | 本仓库 | `train.py` | 背景与物体联合训练 |
 
-外部程序需要单独准备，不包含在本仓库里。分别按对应仓库的说明安装依赖和模型权重。本仓库环境安装见 [README](../README.md#setup)。下面用 `dexmirror` 表示当前 README 配置的训练环境，用 `depth-anything` 表示深度环境；可选 VGGT-X 路线使用 `vggt-long`。读者应替换为自己的环境名，SAM2 Notebook 需要使用安装了 SAM2 的内核。
+外部程序需要单独准备，不包含在本仓库里。依赖和模型权重的安装见 [README](../README.md#setup)。下面用 `dexmirror` 表示训练环境，`depth-anything` 表示深度环境，`sam2` 表示掩码环境；SAM2 Notebook 需要使用安装了 SAM2 的内核。
 
 先在终端设置路径，后续代码块在同一终端执行：
 
 ```bash
 export PROJECTS=/path/to/projects
 export REPO="$PROJECTS/gaussian-splatting-joint"
-export VGGT_ROOT="$PROJECTS/VGGT-X"
 export SAM2_ROOT="$PROJECTS/sam2"
 export DEPTH_ROOT="$PROJECTS/Depth-Anything-V2"
 
 export RAW_SCENE=/path/to/data/raw/scene
-export DATASET=/path/to/data/raw_vggt/scene
+export DATASET=/path/to/datasets/scene
 export MODEL_DIR="$REPO/output/scene_joint"
 ```
 
-`RAW_SCENE` 保存原始输入，`DATASET` 保存制作结果，`MODEL_DIR` 保存训练结果。每个新场景使用单独目录。VGGT-X 的输出位置由 `--post_fix` 决定，见下一节。
+`RAW_SCENE` 保存原始输入，`DATASET` 保存制作结果，`MODEL_DIR` 保存训练结果。每个新场景使用单独目录。
 
 ## 2. 整理照片并重建相机
 
@@ -53,57 +51,24 @@ raw/scene/
 
 背景视角用于训练背景模型，物体视角用于训练独立物体和组合场景。拍摄时应准备能表达背景的视角，以及物体在目标位置上的多视角照片。用于同一个静态物体模型的照片应保持物体位置一致。用于 SAM2 传播的照片尽量按拍摄顺序排列，视角跳变处后续需要额外标注。
 
-### 2.2 路线 A：VGGT-X
+### 2.2 使用 COLMAP 重建并去畸变
 
-在 VGGT-X 环境执行：
-
-```bash
-conda activate vggt-long
-cd "$VGGT_ROOT"
-python demo_colmap_new.py \
-  --scene_dir "$RAW_SCENE" \
-  --post_fix _vggt \
-  --use_ba
-```
-
-当前脚本将后缀加在**输入场景的父目录**上：
-
-```text
-输入：/path/to/data/raw/scene
-输出：/path/to/data/raw_vggt/scene
-```
-
-因此，前面的 `DATASET` 必须与实际输出一致。主要结果是 `sparse/0/cameras.bin`、`images.bin`、`points3D.bin`，以及用于预览的 `sparse/points.ply`。以日志中的 `Saving reconstruction to ...` 为准。
-
-如需指定查询帧，在运行前创建 `prefer_9.txt`，每行写一个完整图片文件名，例如 `00000.jpg`。文件名必须在输入中存在。选择 9 张不同视角的照片后，给上面的命令追加：
-
-```text
---query_frame_num 9 --query_frame_list /absolute/path/to/prefer_9.txt
-```
-
-固定相机内参的数据可追加 `--shared_camera`。这些选项应在同一次重建中设置。当前本地 `demo_colmap_new.py` 使用 `--use_ba`，没有旧记录中的 `--use_ga`、`--save_depth` 接口；训练所需深度按第 5 节单独生成。
-
-检查输出中的注册图像及 `vggt_results.txt`：重建可能剔除部分帧，因此不能只按原始照片数量判断数据是否完整。输出图像可能是指向原图的符号链接，移动或打包数据集时应一并保留链接目标，或复制为实际文件。
-
-### 2.3 路线 B：COLMAP
-
-已有质量合适的 COLMAP 重建可以跳过重新估计。若从照片开始使用本仓库的转换脚本，另选一个新的 `DATASET` 目录，并将照片复制到它的 `input/`：
+已有质量合适的 COLMAP 重建可以跳过重新估计。若从照片开始，将背景和物体照片一起复制到新的 `DATASET/input/`：
 
 ```bash
-export DATASET=/path/to/data/colmap/scene
 mkdir -p "$DATASET/input"
 cp -a "$RAW_SCENE/images/." "$DATASET/input/"
 
 conda activate dexmirror
 cd "$REPO"
-python convert.py -s "$DATASET"
+QT_QPA_PLATFORM=offscreen python convert.py -s "$DATASET" --no_gpu
 ```
 
-该脚本调用系统中的 `colmap`，输出去畸变后的 `images/` 和 `sparse/0/`。后续掩码、深度都应基于这套输出图像制作。当前训练只接受 `PINHOLE` 或 `SIMPLE_PINHOLE` 相机，不能把有畸变的原图与去畸变后的相机参数混用。
+上面的命令适用于 CPU 版 COLMAP；使用支持 CUDA 的 COLMAP 时可去掉 `--no_gpu`。该脚本调用系统中的 `colmap`，输出去畸变后的 `images/` 和 `sparse/0/`。检查哪些照片成功注册，后续掩码、深度都应基于这套输出图像制作。当前训练只接受 `PINHOLE` 或 `SIMPLE_PINHOLE` 相机，不能把有畸变的原图与去畸变后的相机参数混用。
 
-### 2.4 统一训练使用的重建目录
+### 2.3 统一训练使用的重建目录
 
-两条路线最终都整理成：
+将 COLMAP 输出整理成：
 
 ```text
 scene/
@@ -126,11 +91,11 @@ cp -n "$DATASET/sparse/0/points3D.bin" "$DATASET/aligned_sparse/0/"
 
 这里的复制只是适配目录，并不执行几何对齐。如果已经有对齐结果，应直接使用那一整套相机和点云，不能混入另一套重建文件。`cp -n` 会保留已有文件；已有目录必须自行确认来源一致。
 
-如果输入只有文本模型，先在独立目录通过 `colmap model_converter --input_path ... --output_path ... --output_type BIN` 转成二进制，再整理到上面的目录。虽然读取器有部分文本回退逻辑，本文统一使用二进制格式，避免相机和点云从不同位置读入。
+如果输入只有文本模型，先在独立目录通过 `colmap model_converter --input_path ... --output_path ... --output_type BIN` 转成二进制，再整理到上面的目录。当前读取器要求二进制相机和点云文件。
 
 训练、渲染、评估和掩码裁剪统一读取 `aligned_sparse/0` 中的 `cameras.bin`、`images.bin`、`points3D.bin`。缺失或损坏时会直接报错，不再回退读取 `sparse/0` 或 Blender 数据集。`sparse/0` 仍作为 COLMAP 重建的中间输出保留。
 
-训练和点云提取脚本会在缺少 `aligned_sparse/0/points3D.ply` 时，从 `points3D.bin` 生成该文件。VGGT-X 的 `sparse/points.ply` 是另一份预览输出，不应直接改名覆盖它。已有 `points3D.ply` 也必须与当前相机、点云来自同一次重建。
+训练和点云提取脚本会在缺少 `aligned_sparse/0/points3D.ply` 时，从 `points3D.bin` 生成该文件。已有 `points3D.ply` 也必须与当前相机、点云来自同一次重建。
 
 ## 3. 划分背景和物体视角
 
@@ -308,7 +273,7 @@ python utils/make_depth_scale.py \
 
 结果写入 `aligned_sparse/0/depth_params.json`，键为照片主体名，每项包含 `scale` 和 `offset`。检查参数是否有限、是否覆盖所有注册照片，以及是否有大量零或异常尺度。稀疏点轨迹不足的视角可能无法得到可靠校准，生成 JSON 本身不代表每张深度都有效。
 
-相机、点云、深度编码或图像集合变更后，应重新校准；旧 JSON 会被脚本按键合并，制作新版本时应使用干净的结果目录，避免混入旧条目。VGGT 导出的中间深度数组不能只改扩展名就用在这里。
+相机、点云、深度编码或图像集合变更后，应重新校准；旧 JSON 会被脚本按键合并，制作新版本时应使用干净的结果目录，避免混入旧条目。
 
 如果不使用深度，跳过本节，训练时不传 `-d`。只要传入 `-d`，当前程序就会要求存在 `aligned_sparse/0/depth_params.json`，并读取每个相机对应的深度 PNG。
 
